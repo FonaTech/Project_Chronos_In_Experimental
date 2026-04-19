@@ -2,7 +2,6 @@
 
 **一套从架构层原生支持 SSD+DRAM 混合加载推理的 MoE 框架**
 
-[![CI](https://github.com/your-org/project-chronos/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/project-chronos/actions)
 [![PyPI](https://img.shields.io/pypi/v/project-chronos)](https://pypi.org/project/project-chronos/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
@@ -338,9 +337,9 @@ Project_Chronos/
 @misc{chronos2026,
   title  = {Project Chronos: Prefill-Time Expert Loading and Dual-Layer Routing
              for Zero-Stall On-Device MoE Inference},
-  author = {Project Chronos Contributors},
+  author = {Fona and Project Chronos Contributors},
   year   = {2026},
-  url    = {https://github.com/your-org/project-chronos}
+  url    = {[https://github.com/your-org/project-chronos](https://github.com/FonaTech/Project_Chronos_In_Experimental)}
 }
 ```
 
