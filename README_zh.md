@@ -59,7 +59,7 @@ $$L_{total} = L_{CE} + \lambda_1 L_{balance} + \lambda_2 \sum_{t=2}^{T} \| E_t -
 
 ---
 
-## 安装
+## 安装 (Not Ready for PyPI Yet)
 
 ```bash
 pip install project-chronos
