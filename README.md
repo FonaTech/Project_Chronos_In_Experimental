@@ -1,4 +1,4 @@
-# Project Chronos
+# Project Chronos (In Experimental Explore)
 
 **On-Device Low-Latency Lookahead Dual-Layer MoE Inference Architecture**
 
@@ -61,7 +61,7 @@ $$L_{\text{total}} = L_{\text{CE}} + \lambda_1 L_{\text{balance}} + \lambda_2 \s
 
 ---
 
-## Installation
+## Installation (Not Ready in Pypi Yet)
 
 ```bash
 pip install project-chronos
