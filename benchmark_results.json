@@ -1,0 +1,51 @@
+{
+  "minimind": {
+    "name": "MiniMind (pure RAM)",
+    "params_m": 91.4,
+    "ram_model_gb": 0.399,
+    "ram_train_gb": 2.25,
+    "ram_infer_gb": 2.25,
+    "tokens_per_sec": 349.9,
+    "train_losses": [
+      8.9834,
+      8.9272,
+      8.9045,
+      8.8138,
+      8.9289
+    ]
+  },
+  "chronos": {
+    "name": "Chronos (SSD+DRAM hybrid)",
+    "params_m": 111.1,
+    "ram_model_gb": 0.016,
+    "ram_train_gb": 2.443,
+    "ram_infer_gb": 2.631,
+    "tokens_per_sec": 224.3,
+    "train_losses": [
+      8.9058,
+      8.8842,
+      8.9566,
+      9.0308,
+      8.8993
+    ],
+    "cache_stats": {
+      "vram_experts": 4,
+      "vram_capacity": 52,
+      "ram_experts": 4,
+      "ram_capacity_dynamic": 208,
+      "expert_size_kb": 4992,
+      "pinned_ram_used_gb": 0.152,
+      "available_ram_gb": 57.0,
+      "pinned_ram_fraction": 0.0027,
+      "h2d_stream": "default",
+      "storage_format": "safetensors",
+      "cluster_aware": true,
+      "num_clusters": 1,
+      "prefetch_hits": 0,
+      "prefetch_misses": 0,
+      "total_requests": 58,
+      "hit_rate": 0.0
+    },
+    "kv_cache_type": "MLA(latent)+SlidingWindow"
+  }
+}

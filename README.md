@@ -1,6 +1,6 @@
 # Project Chronos (In Experimental)
 
-**The First MoE Architecture Designed from the Ground Up for SSD+DRAM Hybrid Loading**
+**A MoE Architecture Designed from the Ground Up for SSD+DRAM Hybrid Loading**
 
 [![PyPI](https://img.shields.io/pypi/v/project-chronos)](https://pypi.org/project/project-chronos/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)

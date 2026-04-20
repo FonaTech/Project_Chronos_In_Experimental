@@ -1,0 +1,37 @@
+{
+  "config": {
+    "steps": 200,
+    "batch_size": 4,
+    "max_seq_len": 128,
+    "hidden_size": 256,
+    "num_hidden_layers": 4,
+    "num_heads": 4,
+    "num_experts": 4,
+    "lr": 0.0005,
+    "device": "cpu",
+    "data_path": "/Users/Fona/Downloads/Hybrid_LLM/Project_Chronos/tests/fixtures/tiny_pretrain.jsonl",
+    "output": "results/compare_results.json",
+    "max_new_tokens": 64,
+    "decode_runs": 4,
+    "seed": 42
+  },
+  "minimind": {
+    "tokens_per_sec": 945.2542816430732,
+    "expert_activation_fraction": 0.875,
+    "resident_expert_bytes": 40894464.0,
+    "param_bytes": 51670016,
+    "final_ce_loss": 1.7768100500106812
+  },
+  "chronos": {
+    "tokens_per_sec": 692.449101005325,
+    "expert_activation_fraction": 0.9375,
+    "resident_expert_bytes": 20447232.0,
+    "vram_experts": 4.0,
+    "ram_experts": 4.0,
+    "prefetch_hit_rate": 0.0,
+    "param_bytes": 61011584,
+    "final_ce_loss": 0.9643071293830872,
+    "final_lookahead_loss": 1.3840022087097168,
+    "lookahead_t+1_top1": 0.41289370078740156
+  }
+}

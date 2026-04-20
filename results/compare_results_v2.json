@@ -1,0 +1,35 @@
+{
+  "pretrain": {
+    "minimind_ce": 1.9390965700149536,
+    "chronos_ce": 1.9202312231063843
+  },
+  "sft": {
+    "minimind_ce": 2.0527267456054688,
+    "chronos_ce": 2.056156635284424
+  },
+  "dpo": {
+    "minimind_dpo": 0.0008738947799429297,
+    "chronos_dpo": 9.614619193598628e-05,
+    "router_kl_drift_from_pretrain": 0.0014294981956481934
+  },
+  "orpo": {
+    "chronos_or": 0.39957335591316223
+  },
+  "grpo": {
+    "chronos_mean_reward_post": 0.12499999999999997
+  },
+  "measurements": {
+    "tps_minimind": 243.50493386140195,
+    "tps_chronos": 205.35210940057956,
+    "activation_frac_minimind": 0.875,
+    "activation_frac_chronos": 0.5625,
+    "resident_expert_bytes_minimind": 23592960,
+    "resident_expert_bytes_chronos_cached": 11796480
+  },
+  "m3_overlap_benchmark": {
+    "simulated_ssd_ms": 30,
+    "prefetch_for_next_step_ms": 0.09345798753201962,
+    "legacy_step_ms": 35.85374999966007,
+    "overlap_headroom_ms": 35.76029201212805
+  }
+}

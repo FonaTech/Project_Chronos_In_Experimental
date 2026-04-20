@@ -1,6 +1,6 @@
 # Project Chronos (In Experimental)
 
-**一套从架构层原生支持 SSD+DRAM 混合加载推理的 MoE 框架**
+**一套从架构层原生支持 SSD+DRAM 混合加载推理的 MoE 框架，配套完整的 6 阶段训练链路。**
 
 [![PyPI](https://img.shields.io/pypi/v/project-chronos)](https://pypi.org/project/project-chronos/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
@@ -18,7 +18,7 @@
 
 ---
 
-## Chronos 的核心思路：把 IO 挪到 Prefill
+## Chronos 的核心思路：把 IO 挪到 Prefill，把同步挪到事件级
 
 ```
 传统 MoE 解码循环：                    Chronos 解码循环：
@@ -29,18 +29,21 @@
     → [阻塞：SSD→RAM→VRAM，~40ms]          AsyncLoad: SSD→RAM→VRAM（后台）
     → 计算                                 等待加载完毕
     → Token t+1（重复）
-                                       Token t（以及之后每个 token）：
-  每个 token 都在等 IO。                   路由 → 需要哪个专家？
-                                           专家已在 VRAM（已预加载）
-                                           直接计算
-                                           [无 IO，无阻塞]
+                                       Token t（之后每个 token）：
+                                         Prefetch(t+1 expert) ──► (H2D 流)
+  每个 token 都在等 IO。                  forward(t)             (compute 流，并行)
+                                         wait_for_event(t+1 only)
+                                         [无阻塞，无全局 sync]
 ```
 
-核心洞察：**给定 Prompt，MoE 模型在整次生成中会用到哪些专家，是可以从 Prompt 本身预测出来的。** 编程类问题会激活代码专家，推理类问题激活逻辑专家。`IntentClassifier`——一个约 10–15M 参数的小型 Dense 编码器——在 prefill 阶段一次性读取完整 Prompt，预测整次生成所需的专家集合，在第一个 decode token 开始之前全部加载完毕。
+两层关键改进：
+
+1. **Prefill 时机**：`PrefillScheduler` + `IntentClassifier` 在第一个 decode token 之前批量预加载专家。
+2. **事件级同步（M3）**：`promote_to_vram(blocking=False)` 在 `_h2d_stream` 上记录 `torch.cuda.Event`；compute 流通过 `current_stream.wait_event(evt)` **只等所需专家**，不再全局 `stream.synchronize()`。在 30ms 模拟 SSD 延迟下，新路径比旧路径有 **35ms+/token** 的流水线富余空间。
 
 ---
 
-## 三级存储架构
+## 三级存储架构（M1：cluster-aware safetensors）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -50,21 +53,21 @@
 │  │  (IntentCLF)    │  │  + 预测热门专家（预加载完毕）                │  │
 │  └─────────────────┘  └──────────────────────────────────────────────┘  │
 └──────────────────────────────────┬──────────────────────────────────────┘
-                                   │  H2D：独立 CUDA Stream（非阻塞）
+                                   │  H2D：独立 CUDA Stream + per-expert Event
 ┌──────────────────────────────────▼──────────────────────────────────────┐
 │                         Pinned RAM 缓冲区                               │
-│         已预取的专家权重（mmap，页锁定内存）                             │
+│         已预取的专家权重（safetensors mmap，页锁定内存）                │
 │         AsyncPrefetcher 后台线程从 SSD 读入此处                         │
 └──────────────────────────────────┬──────────────────────────────────────┘
-                                   │  顺序读取（4KB 对齐，NVMe 优化）
+                                   │  按 cluster 顺序读（一次 mmap N 个专家）
 ┌──────────────────────────────────▼──────────────────────────────────────┐
 │                              NVMe SSD                                   │
-│         全量专家权重（量化存储，共现聚簇布局）                           │
-│         共激活的专家在磁盘上相邻存放，最大化顺序读带宽                  │
+│   一个 .ctsr 文件 = 一个 Louvain 聚簇（共激活专家打包，连续物理布局）   │
+│   配套 cluster_manifest.json 描述 expert→cluster 映射                   │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**这条链路上没有任何环节阻塞 decode 循环。** 专家权重在后台异步向上搬运，计算流不等待 IO。
+`cluster_manifest.json` 与 `.ctsr` 文件由离线 Louvain 聚类生成；运行时一次 `safetensors.safe_open(...).mmap` 把整个簇拉进 RAM，把随机读改写成顺序读。
 
 ### 缓存未命中时的处理
 
@@ -79,47 +82,74 @@ output = avail[i] * expert_output + (1.0 - avail[i]) * shared_expert_output
 
 ---
 
-## 双层路由：为什么是两个预测器？
+## 双层路由 + 监督的 Lookahead（M2）
 
 | | IntentClassifier（第一层） | LookaheadRouter（第二层） |
 |---|---|---|
 | **触发时机** | Prefill 阶段一次 | Decode 每个 token |
 | **输入** | 完整 Prompt（最多 512 token） | Block 0 的 hidden state |
 | **输出** | 整次生成的专家集合 | t+1、t+2 步的专家 ID |
-| **职责** | 宏观意图识别，批量预加载 | 捕获晚期预测偏差，更新预取队列 |
+| **训练目标** | 真实激活日志监督（Phase 5） | **L_lookahead — 真实路由 t+k 作为 stop-grad teacher（M2）** |
 | **参数量** | ~10–15M（单独训练） | ~2M（随主模型训练） |
 
-两者互补：第一层处理**宏观任务类型**，第二层处理**微观上下文转折**。
+M2 之前 LookaheadRouter 没有任何监督——只是个未训练的 head。M2 引入：
+
+```
+L_lookahead = (1/K) · Σ_{k=1..K} CE( stopgrad(real_router_{t+k}), lookahead_pred_t^{(k)} )
+```
+
+让前瞻头真正学习预测未来 K 步的路由分布。
 
 ---
 
-## 这套架构真的能实现吗？诚实评估
+## 完整训练链路（Stage 1 → Stage 6）
 
-### 确定可以实现的
+每个阶段都是独立的 entry script，**全部继承 Chronos 损失混合器**（lookahead + temporal + balance），并在对齐阶段引入**路由 KL 锚定**防止缓存命中率被 RL/DPO 梯度毁掉。
 
-- **长生成（100+ tokens）的解码阶段零 IO**：PrefillScheduler 将所有专家加载前置，decode 流中 VRAM 已包含所需专家。
-- **永不硬阻塞**：Soft Gating 确保 cache miss 只带来轻微精度混合，不冻结解码器。
-- **VRAM 占用大幅降低**：只需常驻共享专家 + 预测热门专家，而非全量专家。
-- **NVMe 带宽高效利用**：共现聚簇存储确保高频共激活专家相邻，最大化顺序读性能。
+| Stage | 脚本 | 核心损失 | Router KL 锚定 (默认 λ) |
+|---|---|---|---|
+| 1 Pretrain  | `train_chronos.py`         | CE + balance + temporal + lookahead | 0.0 (off) |
+| 2 SFT       | `train_chronos_sft.py`     | + 上述 mix                          | 0.01 (weak) |
+| 3 DPO       | `train_chronos_dpo.py`     | DPO log-σ(β·logits) + mix          | 0.10 (strong) |
+| 4 ORPO      | `train_chronos_orpo.py`    | NLL + λ·OR（无 ref model）          | 0.10 |
+| 5 GRPO      | `train_chronos_grpo.py`    | PG·A − β·KL（含 ToyReward / 可插 LMRewardModel）| 0.10 |
+| 6 Distill   | `train_chronos_distill.py` | α·T²·KL(s‖t) + (1−α)·CE             | 0.05 |
 
-### 有条件成立的
+完整 6 阶段端到端对比见 `tools/compare_minimind_chronos_v3.py`。
 
-| 主张 | 实际情况 |
-|---|---|
-| "不影响效率" | 不完全准确：prefill 阶段增加 SSD 加载耗时（具体时长取决于 NVMe 带宽和专家数量）。**对短回答（< 20 tokens）首 token 延迟会有感知上升。** 对长回答，这笔开销在第一个 token 后就被均摊掉了。 |
-| IntentClassifier 预测准确率 ≥ 85% | **需要真实激活数据训练后才能达到。** 冷启动阶段使用频率启发式，安全但精度较低。运行几百轮采集真实 prompt→激活日志后准确率持续提升。 |
-| 时间局部性损失提升命中率 | 理论上成立。λ₂ 过大会轻微损害路由质量，需通过 Optuna 自动搜索找最优平衡点。 |
+---
 
-> **注意**：目前尚未完成系统性定量对比基准测试。上述性质基于架构分析和小规模实验，大规模实测数据将在 Phase 5 补充。
+## 多后端调度（M5）
 
-### 与现有框架的本质差异
+```python
+from chronos.backend import BackendDispatcher
+d = BackendDispatcher()
+d.available()      # ['mlx', 'mps', 'cpu'] on Apple Silicon
+                   # ['cuda', 'cpu']        on NVIDIA host
+d.select()         # 自动选最佳；可被 CHRONOS_BACKEND 环境变量覆盖
+d.describe()       # 人类可读的能力总览
+```
 
-主流推理框架（vLLM、llama.cpp、ollama）全部使用**被动 offload**：decode 循环发现 cache miss 才同步加载。Chronos 将被动模式转化为**主动预测性**模式——不是运行时补丁，而是从模型设计层就融入：
+- **一等公民（训练 + 推理）**：`cpu`、`mps`、`cuda`、`mlx`
+- **推理仅 / 实验性**：`vulkan`（仅当 PyTorch `USE_VULKAN=ON` 自定义构建时存在）
+- **第三方插件钩子**：`opencl`（替换 `chronos/backend/ext/opencl.py:PROBE()`）
 
-1. **PrefillScheduler** 读取整个 Prompt，批量预加载专家，再开始 decode——工业框架中无现成实现
-2. **LookaheadRouter** 在 decode 内部提前 1–2 步预测，与 PrefillScheduler 形成双保险
-3. **时间局部性损失** 从训练阶段主动鼓励相邻 token 复用同一批专家，让预测准确率的上限更高
-4. **共现聚簇存储** 在磁盘布局层就优化 IO 模式，而非依赖 OS 页缓存碰运气
+诚实声明：上游 PyTorch 没有 OpenCL 后端、Vulkan 也仅在自定义构建中可用。Chronos 提供 dispatcher 接缝，使第三方插件无需改核心代码即可接入。
+
+---
+
+## HuggingFace / vLLM 兼容（M5）
+
+- `ChronosForCausalLM` 继承 `PreTrainedModel`，已注册 `AutoConfig` / `AutoModelForCausalLM`，无需 `trust_remote_code`：
+
+  ```python
+  from transformers import AutoModelForCausalLM
+  model = AutoModelForCausalLM.from_pretrained("./out_dir")
+  ```
+
+- `chronos.model.hf_io.save_chronos_pretrained` / `load_chronos_pretrained` 输出标准 `model.safetensors` + `config.json`，并把 `cluster_manifest.json` + `.ctsr` 一起带过去；roundtrip logits 0.00e+00 偏差。
+
+- `chronos.serving.register_chronos_with_vllm()` 在已安装 vLLM 时把 Chronos 注册到 `ModelRegistry`；未安装时打印安装提示，**不报错**。worker 侧 mask 注入 hook 见 `docs/vllm_integration.md`。
 
 ---
 
@@ -128,59 +158,31 @@ output = avail[i] * expert_output + (1.0 - avail[i]) * shared_expert_output
 | 特性 | llama.cpp offload | vLLM offload | **Project Chronos** |
 |---|---|---|---|
 | 专家预测 | 无（被动） | 无（被动） | **主动预测（IntentCLF + LookaheadRouter）** |
+| Lookahead 训练 | n/a | n/a | **L_lookahead 真实监督（M2）** |
 | IO 时机 | Decode 期间（阻塞） | Decode 期间（阻塞） | **Prefill 期间（异步，前置）** |
+| Decode 流水线 | 同步 | 同步 | **双流 + per-expert event（M3）** |
 | Cache miss 行为 | 硬阻塞 | 硬阻塞 | **Soft Gating（零阻塞）** |
-| 训练集成 | 事后补丁 | 事后补丁 | **原生损失项（时间局部性）** |
-| 磁盘布局优化 | 无 | 无 | **共现聚簇，NVMe 顺序读优化** |
-| CUDA Stream 隔离 | 无 | 部分 | **独立 H2D Stream** |
+| 磁盘格式 | gguf | safetensors | **cluster-packed safetensors（.ctsr）** |
+| 训练集成 | 事后补丁 | 事后补丁 | **6 阶段全栈 + 路由 KL 锚定** |
+| 后端调度 | 编译期固定 | CUDA-only | **cpu / mps / cuda / mlx 自动 + vulkan/opencl 钩子** |
 | Apple Silicon 原生 | 部分 | 无 | **完整 MLX 后端** |
+| HuggingFace 兼容 | 仅 GGUF | ✓ | ✓ + 携带专家缓存 |
+| vLLM 兼容 | n/a | 原生 | **可选 adapter（按需注册）** |
 
 ---
 
-## 架构概览
+## 损失函数（完整形式）
 
-```
-输入 Token（完整 Prompt）
-        │
-        ▼
-┌───────────────────────────────────────┐
-│  IntentClassifier（10–15M Dense）     │  ← Prefill 阶段执行一次
-│  读取完整 Prompt → IntentVector       │
-└───────────────────┬───────────────────┘
-                    │
-                    ▼
-┌───────────────────────────────────────┐
-│  ExpertPredictor                      │
-│  IntentVector → ExpertSet             │
-│  （阈值筛选 + VRAM 预算上限）          │
-└───────────────────┬───────────────────┘
-                    │
-                    ▼
-┌───────────────────────────────────────┐   ┌─────────────────────────┐
-│  PrefillScheduler                     │──▶│  AsyncLoader 后台线程   │
-│  批量加载预测专家                     │   │  SSD → Pinned RAM       │
-│  等待加载完毕                         │   │  → VRAM（独立 CUDA 流） │
-└───────────────────┬───────────────────┘   └─────────────────────────┘
-                    │
-                    ▼
-    Decode 循环（零 IO，全速运行）
-        │
-        ├─ Block 0: MLAAttention
-        │     └─ LookaheadRouter → 预测 t+1、t+2 专家
-        │           └─ AsyncPrefetcher: 调度后台加载
-        │
-        ├─ Block 1–N: SlidingWindowAttention / MLAAttention（交替）
-        │
-        └─ ChronosMOEFeedForward
-              ├─ 专家在 VRAM？→ 直接计算
-              └─ Cache miss？ → Soft Gating 混合共享专家
-```
+$$
+L_{\text{total}} = L_{\text{base}} + \lambda_{\text{bal}} L_{\text{balance}} + \lambda_{\text{tmp}} L_{\text{temporal}} + \lambda_{\text{LA}} L_{\text{lookahead}} + \lambda_{\text{anc}} L_{\text{router-KL-anchor}}
+$$
 
-### 损失函数
+- $L_{\text{base}}$：阶段相关（CE / DPO / ORPO / GRPO / KD）
+- $L_{\text{temporal}} = \frac{1}{T} \sum_{t=2}^{T} \| E_t - E_{t-1} \|_2^2$ — 鼓励相邻 token 复用同一批专家
+- $L_{\text{lookahead}} = \frac{1}{K} \sum_{k=1}^{K} \mathrm{CE}\big(\text{stopgrad}(P_{t+k}),\ Q_t^{(k)}\big)$ — 监督前瞻头
+- $L_{\text{router-KL-anchor}} = \mathrm{KL}\big(\pi_\theta^{\text{router}} \,\|\, \pi_{\text{pretrain}}^{\text{router}}\big)$ — 防止对齐阶段毁掉聚簇布局
 
-$$L_{\text{total}} = L_{\text{CE}} + \lambda_1 L_{\text{balance}} + \lambda_2 \sum_{t=2}^{T} \| E_t - E_{t-1} \|_2^2$$
-
-时间局部性项 $\lambda_2$ **在训练阶段主动鼓励相邻 token 路由到同一批专家**——不只是为了降低 loss，而是因为稳定的路由让相同专家持续驻留 VRAM，缓存命中率天然提高。λ₁ 和 λ₂ 均通过 **Optuna TPE 贝叶斯搜索**自动调优。
+`λ` 全部支持 Optuna TPE 自动搜索（包括 `hidden_size` / `num_experts` / `kv_latent_dim` 等结构超参）。
 
 ---
 
@@ -190,7 +192,7 @@ $$L_{\text{total}} = L_{\text{CE}} + \lambda_1 L_{\text{balance}} + \lambda_2 \s
 pip install project-chronos
 ```
 
-或从源码安装：
+或从源码：
 
 ```bash
 git clone https://github.com/your-org/project-chronos
@@ -203,6 +205,11 @@ pip install -e ".[dev]"
 pip install "project-chronos[mlx]"
 ```
 
+**vLLM 服务（可选，仅 Linux+CUDA）：**
+```bash
+pip install vllm
+```
+
 > **minimind 依赖**：Project Chronos 使用 [minimind](https://github.com/jingyaogong/minimind) 作为 MoE 内核。
 > 若本地未找到，首次 import 时自动克隆至 `~/.cache/chronos/minimind-master/`。
 > minimind 采用 **Apache-2.0** 授权，完整归属见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
@@ -213,7 +220,7 @@ pip install "project-chronos[mlx]"
 
 ## 快速开始
 
-### Web UI
+### Web UI（M6 — 7 个 Tab，4 种语言）
 
 ```bash
 chronos-ui
@@ -221,50 +228,74 @@ chronos-ui
 python chronos_app.py
 ```
 
-### 训练
+包含：⚙️ Config（含右侧实时参数估算面板，合并了 Designer）/ 🏋️ Train（拥有 data_path）/ 🧪 6-Stage Pipeline（每阶段独立数据路径）/ 💬 Inference / 📊 Benchmark（Markdown 表 + BarPlot）/ 🔬 Auto-Tune（持久化日志 + 一键 Apply Best → Config）/ 📡 IO Monitor。i18n 支持 zh-Hans / zh-Hant / en / ja。
+
+### Stage 1：预训练
 
 ```bash
-chronos train \
-    --data_path ./dataset/pretrain.jsonl \
-    --hidden_size 512 \
-    --num_hidden_layers 8 \
-    --num_experts 4 \
-    --lambda_temporal 1e-3 \
-    --epochs 2 \
-    --device cuda:0
+python train_chronos.py \
+    --data_path ./tests/fixtures/tiny_pretrain.jsonl \
+    --hidden_size 256 --num_hidden_layers 4 --num_experts 4 \
+    --epochs 1 --device cpu --save_dir ./out
 ```
 
-### Phase 1 验证（前瞻准确率）
+### Stage 2-5：对齐链路
 
 ```bash
-chronos eval \
-    --data_path ./dataset/eval.jsonl \
-    --model_path ./out/chronos_512_moe.pth \
-    --device cuda
+python train_chronos_sft.py   --data_path ./tests/fixtures/tiny_sft.jsonl   --from_weight chronos --save_dir ./out --device cpu
+python train_chronos_dpo.py   --data_path ./tests/fixtures/tiny_dpo.jsonl   --from_weight sft     --save_dir ./out --device cpu
+python train_chronos_orpo.py  --data_path ./tests/fixtures/tiny_dpo.jsonl   --from_weight sft     --save_dir ./out --device cpu
+python train_chronos_grpo.py  --data_path ./tests/fixtures/tiny_grpo.jsonl  --from_weight orpo    --save_dir ./out --device cpu \
+    --reward toy   # 或 lm:/path/to/reward-model
 ```
+
+### Stage 6：蒸馏
+
+```bash
+python train_chronos_distill.py \
+    --data_path ./tests/fixtures/tiny_sft.jsonl \
+    --teacher_path ./out/sft_192_moe.pth \
+    --from_weight grpo --save_dir ./out --device cpu \
+    --alpha 0.7 --temperature 4.0
+```
+
+### 端到端对比（minimind vs Chronos）
+
+```bash
+python tools/compare_minimind_chronos_v3.py \
+    --pretrain_steps 150 --align_steps 30 --distill_steps 30 \
+    --simulated_ssd_ms 30 --device cpu \
+    --output results/compare_results_v3.json
+```
+
+输出包括：每阶段 loss、HF roundtrip Δlogit、tokens/sec、激活专家比例、常驻专家字节、M3 流水线富余空间、当前主机后端列表。
 
 ### 专家聚簇存储（最大化 SSD 顺序读）
 
-```bash
-chronos export \
-    --model_path ./out/chronos_512_moe.pth \
-    --data_path  ./dataset/calib.jsonl \
-    --output_dir ./expert_cache_clustered
+```python
+from chronos.io.cluster_layout import (
+    collect_activation_log, build_cooccurrence_matrix,
+    try_louvain_clustering, repack_expert_weights_safetensors,
+)
+log = collect_activation_log(model, calib_loader, "cpu", max_batches=50)
+clusters = try_louvain_clustering(build_cooccurrence_matrix(log, num_experts))
+repack_expert_weights_safetensors(model, clusters, "./expert_cache_clustered")
 ```
 
-### λ 超参数自动搜索
+### λ + 结构超参自动搜索
 
 ```python
 from chronos.tuning.chronos_auto_tuner import ChronosAutoTuner, ChronosSearchSpaceConfig
 
 tuner = ChronosAutoTuner()
 tuner.start(
-    model_id="./out/chronos_512_moe.pth",
+    model_id="./out/chronos_256_moe.pth",
     dataset_path="./dataset/train.jsonl",
     search_space=ChronosSearchSpaceConfig(
-        tune_lambda_temporal=True,
-        tune_lambda_balance=True,
-        tune_lookahead_steps=True,
+        tune_lambda_balance=True, tune_lambda_temporal=True,
+        tune_lambda_lookahead=True, tune_lookahead_steps=True,
+        tune_hidden_size=True, tune_num_experts=True,
+        tune_num_shared_experts=True, tune_kv_latent_dim=True,
     ),
     n_trials=20,
 )
@@ -278,45 +309,86 @@ tuner.start(
 Project_Chronos/
 ├── chronos/
 │   ├── deps.py                    # 自动下载 minimind（若本地未找到）
+│   ├── __init__.py                # 注册 AutoConfig / AutoModelForCausalLM
 │   ├── model/
-│   │   ├── config.py              # ChronosConfig
+│   │   ├── config.py              # ChronosConfig（lookahead/temporal/anchor/storage_format 等）
 │   │   ├── hybrid_attention.py    # MLAAttention + SlidingWindowAttention
 │   │   ├── lookahead_router.py    # 逐 token 前瞻预测器（第二层）
 │   │   ├── moe_chronos.py         # ChronosMOEFeedForward + 共享专家 + Soft Gating
-│   │   ├── model_chronos.py       # ChronosForCausalLM
-│   │   └── temporal_loss.py       # 时间局部性损失
+│   │   ├── model_chronos.py       # ChronosForCausalLM（_tied_weights_keys 已修补）
+│   │   ├── temporal_loss.py       # 时间局部性 + lookahead 监督损失
+│   │   └── hf_io.py               # save/load_chronos_pretrained + AutoModel 注册
 │   ├── io/
-│   │   ├── expert_store.py        # 三级存储，独立 CUDA H2D Stream
-│   │   ├── async_prefetcher.py    # 异步预取引擎
-│   │   └── cluster_layout.py      # 共现聚簇存储布局生成
+│   │   ├── expert_store.py        # 三级存储 + per-expert Event + 非阻塞 promote
+│   │   ├── async_prefetcher.py    # 异步预取（prefetch_only / promote_current 已分离）
+│   │   ├── storage.py             # ClusterStorage：.ctsr safetensors + manifest
+│   │   ├── cluster_layout.py      # 共现聚簇 + safetensors 重排
+│   │   └── io_simulator.py        # CHRONOS_SIM_SSD_MS 测试钩子（M3）
 │   ├── router/
 │   │   ├── intent_classifier.py   # Prompt 级专家预测器（第一层，~10M 参数）
 │   │   ├── expert_predictor.py    # IntentVector → ExpertSet（含预算上限）
 │   │   └── prefill_scheduler.py   # 编排 prefill 阶段批量预加载
 │   ├── mlx/                       # Apple Silicon 原生后端
-│   │   ├── attention.py
-│   │   ├── moe.py
-│   │   ├── model.py
-│   │   ├── expert_store.py
-│   │   └── inference.py
+│   │   ├── attention.py / moe.py / model.py / expert_store.py / inference.py
 │   ├── runtime/
-│   │   ├── cache_manager.py       # 统一缓存接口
-│   │   └── inference_engine.py    # 端到端推理引擎（PyTorch）
+│   │   ├── cache_manager.py       # prefetch_for_next_step / ensure_resident（M3）
+│   │   ├── inference_engine.py    # 端到端推理引擎（重排为 H2D-compute 重叠）
+│   │   └── metrics.py             # MetricsBus（IO Monitor 数据源）
+│   ├── trainer/
+│   │   ├── loss_mixin.py          # chronos_loss_term + router_kl_anchor + capture_reference_routing
+│   │   ├── chronos_trainer.py     # Pretrain
+│   │   ├── sft_trainer.py         # Stage 2
+│   │   ├── dpo_trainer.py         # Stage 3
+│   │   ├── orpo_trainer.py        # Stage 4（无 ref model）
+│   │   ├── grpo_trainer.py        # Stage 5（含 self-contained rollout）
+│   │   ├── distill_trainer.py     # Stage 6（KL/T² + α 混合）
+│   │   └── reward.py              # ToyReward / LMRewardModel / build_reward_fn
 │   ├── tuning/
-│   │   └── chronos_auto_tuner.py  # Optuna λ 搜索
+│   │   └── chronos_auto_tuner.py  # Optuna λ + 结构超参搜索
 │   ├── eval/
-│   │   ├── io_profiler.py         # Phase 1 验证
+│   │   ├── io_profiler.py         # Phase 1 验证（前瞻准确率）
 │   │   └── benchmark.py           # 端到端基准测试
 │   ├── data/
 │   │   └── flexible_dataset.py    # 自动识别任意 JSONL 字段格式
-│   ├── backend.py                 # 自动检测 MLX / CUDA / MPS / CPU
+│   ├── backend/
+│   │   ├── __init__.py            # BackendDispatcher（cpu/mps/cuda/mlx）
+│   │   ├── dispatcher.py          # 探针 + 优先级 + 训练能力声明
+│   │   └── ext/opencl.py          # 第三方 OpenCL 插件钩子（stub）
+│   ├── _backend_legacy.py         # 向后兼容 build_model() 等旧 API
+│   ├── serving/
+│   │   ├── __init__.py
+│   │   └── vllm_adapter.py        # 可选 vLLM 注册（无 vLLM 时优雅降级）
 │   └── cli.py                     # 统一 CLI
-├── ui/                            # Gradio Web UI（4 语言 i18n）
+├── ui/                            # Gradio Web UI（i18n: zh-Hans/zh-Hant/en/ja）
+│   ├── i18n.py
+│   ├── estimator.py               # 实时参数量/内存估算（与 Config 同步）
+│   └── tabs/
+│       ├── config_tab.py          # 已合并 Designer，右侧实时估算面板
+│       ├── train_tab.py           # 拥有 data_path（不再属于 Config）
+│       ├── pipeline_tab.py        # 6 阶段，每段独立 data_path
+│       ├── inference_tab.py
+│       ├── benchmark_tab.py       # Markdown 表 + gr.BarPlot
+│       ├── autotune_tab.py        # 持久化日志 + Apply Best → Config
+│       └── iomon_tab.py           # MetricsBus 实时仪表盘
 ├── chronos_app.py                 # Web UI 入口
-├── train_chronos.py               # 训练入口
-├── tests/test_smoke.py
+├── train_chronos.py               # Stage 1 入口
+├── train_chronos_sft.py           # Stage 2 入口
+├── train_chronos_dpo.py           # Stage 3 入口
+├── train_chronos_orpo.py          # Stage 4 入口
+├── train_chronos_grpo.py          # Stage 5 入口
+├── train_chronos_distill.py       # Stage 6 入口
+├── tools/
+│   ├── compare_minimind_chronos.py      # v1 (M1+M2)
+│   ├── compare_minimind_chronos_v2.py   # v2 (M3+M4)
+│   └── compare_minimind_chronos_v3.py   # v3 (含 6 阶段 + HF roundtrip + 后端报告)
+├── tests/
+│   ├── test_smoke.py              # 18 个单元测试
+│   ├── test_smoke_cuda.py         # 仅 CUDA 主机执行
+│   └── fixtures/                  # tiny_pretrain / tiny_sft / tiny_dpo / tiny_grpo
+├── docs/
+│   └── vllm_integration.md
 ├── pyproject.toml
-└── README.md
+└── README.md / README_zh.md / THIRD_PARTY_NOTICES.md
 ```
 
 ---
@@ -327,7 +399,13 @@ Project_Chronos/
 - [x] Phase 2: 异步 IO 引擎 + 三级存储 + 共现聚簇布局
 - [x] Phase 3: 混合注意力（MLA + SlidingWindow）+ PrefillScheduler + 双层路由
 - [x] Phase 4: MLX 原生后端、Web UI、CLI、Optuna λ 搜索、开源发布
-- [ ] Phase 5: 在大规模激活语料上训练 IntentClassifier；7B+ 规模模型基准测试
+- [x] **M1**: cluster-aware safetensors 三级存储（替换 .pt pickle）
+- [x] **M2**: 真实 lookahead 监督损失（`L_lookahead`）
+- [x] **M3**: 双流解码流水线（per-expert event，非阻塞 H2D）
+- [x] **M4**: 完整 SFT / DPO / ORPO / GRPO 训练器 + 路由 KL 锚定
+- [x] **M5**: HF safetensors I/O + AutoModel 注册 + vLLM adapter + 多后端调度 + Stage 6 蒸馏 + 可插 reward 模型
+- [x] **M6**: WebUI v2（合并 Config+Designer、6 阶段独立数据路径、autotune 持久化 & Apply Best、Benchmark BarPlot、IO Monitor）
+- [ ] Phase 5（待办）: 大规模激活语料上训练 IntentClassifier；7B+ 规模基准；vLLM worker 端 mask 注入；Vulkan/OpenCL 实际 kernel
 
 ---
 

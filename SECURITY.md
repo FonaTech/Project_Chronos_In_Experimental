@@ -10,6 +10,6 @@
 
 Please **do not** open a public GitHub issue for security vulnerabilities.
 
-Email: foreverzyf@outlook.com
+Email: security@your-org.com
 
 We will respond within 72 hours and coordinate a fix before public disclosure.

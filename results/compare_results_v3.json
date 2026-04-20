@@ -1,0 +1,47 @@
+{
+  "backends": [
+    "mlx",
+    "mps",
+    "cpu"
+  ],
+  "selected_backend": "mlx",
+  "pretrain": {
+    "minimind_ce": 1.9390965700149536,
+    "chronos_ce": 1.9202312231063843
+  },
+  "hf_roundtrip": {
+    "max_logit_delta": 0.0
+  },
+  "sft": {
+    "minimind_ce": 2.0852773189544678,
+    "chronos_ce": 2.042121410369873
+  },
+  "dpo": {
+    "minimind_dpo": 6.446283805416897e-05,
+    "chronos_dpo": 4.864171569352038e-05,
+    "router_kl_drift_from_pretrain": 0.0011860354570671916
+  },
+  "orpo": {
+    "chronos_or": 0.39581388235092163
+  },
+  "grpo": {
+    "chronos_mean_reward_post": 1.0083333333333333
+  },
+  "distill": {
+    "chronos_final_kd": 0.013327084481716156
+  },
+  "measurements": {
+    "tps_minimind": 423.4425178566922,
+    "tps_chronos": 565.3915219323558,
+    "activation_frac_minimind": 0.875,
+    "activation_frac_chronos": 0.5625,
+    "resident_expert_bytes_minimind": 23592960,
+    "resident_expert_bytes_chronos_cached": 11796480
+  },
+  "m3_overlap_benchmark": {
+    "simulated_ssd_ms": 30,
+    "prefetch_for_next_step_ms": 0.06408299668692052,
+    "legacy_step_ms": 36.26787499524653,
+    "overlap_headroom_ms": 36.20379199855961
+  }
+}

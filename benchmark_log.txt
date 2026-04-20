@@ -1,0 +1,30 @@
+[05:45:46] Starting benchmark comparison...
+[05:45:46] === Benchmark 1: MiniMind (pure RAM) ===
+[05:45:46]   params=91.4M  RAM delta=0.399GB
+[05:45:46]   step 1/5 loss=8.9834
+[05:45:46]   step 2/5 loss=8.9272
+[05:45:46]   step 3/5 loss=8.9045
+[05:45:47]   step 4/5 loss=8.8138
+[05:45:47]   step 5/5 loss=8.9289
+[05:45:47]   TPS=349.9  RAM_train=2.250GB  RAM_infer=2.250GB
+[05:45:47] === Benchmark 2: Chronos (SSD+DRAM hybrid) ===
+[05:45:47]   params=111.1M  RAM delta=0.016GB
+[05:45:47]   step 1/5 loss=8.9058
+[05:45:47]   step 2/5 loss=8.8842
+[05:45:48]   step 3/5 loss=8.9566
+[05:45:48]   step 4/5 loss=9.0308
+[05:45:48]   step 5/5 loss=8.8993
+[05:45:48]   TPS=224.3  RAM_train=2.443GB  RAM_infer=2.631GB
+[05:45:48]   cache_stats={'vram_experts': 4, 'vram_capacity': 52, 'ram_experts': 4, 'ram_capacity_dynamic': 208, 'expert_size_kb': 4992, 'pinned_ram_used_gb': 0.152, 'available_ram_gb': 57.0, 'pinned_ram_fraction': 0.0027, 'h2d_stream': 'default', 'storage_format': 'safetensors', 'cluster_aware': True, 'num_clusters': 1, 'prefetch_hits': 0, 'prefetch_misses': 0, 'total_requests': 58, 'hit_rate': 0.0}
+[05:45:48] 
+=== COMPARISON SUMMARY ===
+[05:45:48] MiniMind (pure RAM):
+[05:45:48]   tokens/s     : 349.9
+[05:45:48]   RAM (train)  : 2.25 GB
+[05:45:48]   RAM (infer)  : 2.25 GB
+[05:45:48] Chronos (SSD+DRAM hybrid):
+[05:45:48]   tokens/s     : 224.3
+[05:45:48]   RAM (train)  : 2.443 GB
+[05:45:48]   RAM (infer)  : 2.631 GB
+[05:45:48]   KV cache     : MLA(latent)+SlidingWindow
+[05:45:48] Results saved to /Users/Fona/Downloads/Hybrid_LLM/Project_Chronos/benchmark_results.json
