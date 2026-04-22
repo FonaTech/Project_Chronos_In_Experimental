@@ -45,6 +45,10 @@ class ChronosConfig(MiniMindConfig):
         # optimized for. Typical values:
         #   pretrain: 0.0,  SFT: 0.01,  DPO/ORPO/GRPO: 0.1
         self.lambda_router_anchor: float = kwargs.pop("lambda_router_anchor", 0.0)
+        # M7: regularization defaults. MiniMindConfig defaults dropout=0.0
+        # and weight_decay isn't even a config field — both major causes
+        # of overfitting on small corpora. Override here.
+        kwargs.setdefault("dropout", 0.1)
         # Force MoE on
         kwargs.setdefault("use_moe", True)
         super().__init__(**kwargs)

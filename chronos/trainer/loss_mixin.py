@@ -82,7 +82,19 @@ def chronos_loss_term(
     if aux_loss is not None:
         lambda_balance = float(getattr(config, "lambda_balance", 0.0))
         if lambda_balance > 0.0:
-            loss = loss + lambda_balance * aux_loss
+            # Prefer the un-scaled raw aux summed across MoE layers so we
+            # don't double-multiply by router_aux_loss_coef. Falls back to
+            # whatever the model handed us if aux_loss_raw isn't populated
+            # (e.g. eval-mode forward).
+            raw_total = base_loss.new_zeros(())
+            saw_raw = False
+            for layer in model.model.layers:
+                mlp = getattr(layer, "mlp", None)
+                if isinstance(mlp, ChronosMOEFeedForward) and mlp.aux_loss_raw is not None:
+                    raw_total = raw_total + mlp.aux_loss_raw
+                    saw_raw = True
+            aux_term = raw_total if saw_raw else aux_loss
+            loss = loss + lambda_balance * aux_term
 
     router_4d = collect_router_probs(model, with_grad=True)
     if router_4d is not None and router_4d.shape[1] > 1:

@@ -39,8 +39,10 @@ def build_pipeline_tab():
         gr.Markdown(f"### {t('pipeline.title')}")
 
         with gr.Row():
-            save_dir = gr.Textbox(value="out", label="save_dir (shared)", scale=2)
-            steps    = gr.Number(value=30, precision=0, label="steps (per stage, shared)", scale=1)
+            save_dir = gr.Textbox(value="out", label=t("pipeline.save_dir"), scale=2)
+            steps    = gr.Number(value=30, precision=0, label=t("pipeline.steps"), scale=1)
+            register_translatable(save_dir, "pipeline.save_dir")
+            register_translatable(steps,    "pipeline.steps")
 
         # Per-stage rows: name + data_path + (optional) teacher_path + Run button
         per_stage_rows = []  # list of dicts {data, teacher_or_None, status, run_btn}
@@ -50,13 +52,13 @@ def build_pipeline_tab():
                 # Default to a RELATIVE path so the textbox is portable across
                 # checkouts. Subprocess runs with cwd=repo_root, so the path
                 # resolves against the project directory.
-                data_box = gr.Textbox(value=default_data, label=f"{name} data_path", scale=3)
+                data_box = gr.Textbox(value=default_data, label=f"{name} {t('pipeline.data_path')}", scale=3)
                 teacher_box = (
-                    gr.Textbox(value="", label=f"{name} teacher_path",
+                    gr.Textbox(value="", label=f"{name} {t('pipeline.teacher_path')}",
                                placeholder=os.path.join("out", "sft_<H>_moe.pth"), scale=2)
                     if takes_teacher else None
                 )
-                status_box = gr.Textbox(value="pending", label="status", interactive=False, scale=1)
+                status_box = gr.Textbox(value="pending", label=t("pipeline.status"), interactive=False, scale=1)
                 run_btn = gr.Button(f"▶ {name}", scale=1)
             per_stage_rows.append({
                 "name": name, "script": script, "from_weight": from_w,
@@ -65,7 +67,8 @@ def build_pipeline_tab():
             })
 
         log_box = gr.Textbox(label="log (stage runs append)", lines=20, interactive=False, autoscroll=True)
-        clear_log = gr.Button("Clear log")
+        clear_log = gr.Button(t("pipeline.clear_log"))
+        register_translatable(clear_log, "pipeline.clear_log")
         clear_log.click(fn=lambda: "", outputs=[log_box])
 
         def make_runner(idx):

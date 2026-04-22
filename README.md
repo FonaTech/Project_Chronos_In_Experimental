@@ -1,6 +1,6 @@
-# Project Chronos (In Experimental)
+# Project Chronos (Experimental)
 
-**A MoE Architecture Designed from the Ground Up for SSD+DRAM Hybrid Loading**
+**A storage-aware MoE stack built for SSD+DRAM hybrid inference, with a full six-stage training pipeline.**
 
 [![PyPI](https://img.shields.io/pypi/v/project-chronos)](https://pypi.org/project/project-chronos/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
@@ -10,198 +10,196 @@
 
 ---
 
-## The Problem Every MoE User Faces
+## Why reactive MoE offload breaks down
 
-Every mainstream MoE model (Mixtral, DeepSeek-MoE, Qwen-MoE) makes routing decisions **per-token, per-layer, at runtime** — the moment the GPU needs an expert, it checks whether it's in VRAM. On consumer hardware with 4–8 GB VRAM, the answer is usually "no", and the decode loop **blocks while the system paginates** from SSD through RAM into VRAM.
+Mainstream MoE models such as Mixtral, DeepSeek-MoE, and Qwen-MoE make routing decisions **at decode time, token by token**. The model discovers which experts it needs only when the next token is already on the critical path. If those experts are not resident in VRAM, generation stalls while weights are moved from SSD to RAM to VRAM.
 
-This is not a configuration problem. It is a **fundamental architectural mismatch**: these models were designed assuming full VRAM residency, then bolted onto offload runtimes as an afterthought.
+That is not a tuning issue. It is an architectural mismatch.
 
-The result: **< 5 tokens/s** on hardware that can do 50+ tokens/s for dense models of the same parameter count.
-
----
-
-## The Chronos Approach: IO as a First-Class Citizen
-
-Project Chronos is a MoE architecture where **storage-tier awareness is baked in from the model design level, not added as a runtime patch**.
-
-### Core Principle: Move All IO to Prefill
-
-```
-Traditional MoE decode loop:          Chronos decode loop:
-                                       
-  Token t                               Prefill (once):
-    → Route → Expert needed?               Read full prompt
-    → Expert in VRAM? No                   IntentClassifier → predict expert set
-    → [BLOCK: SSD→RAM→VRAM, ~40ms]         AsyncLoad: SSD→RAM→VRAM (background)
-    → Compute                              Wait for load complete
-    → Token t+1 (repeat)                
-                                        Token t (and every token after):
-  Every token pays the IO tax.            Route → Expert needed?
-                                          Expert in VRAM? YES (pre-loaded)
-                                          Compute immediately
-                                          [no IO, no blocking]
-```
-
-The key insight: **a language model's expert usage for a given prompt is predictable from the prompt itself.** A coding question will route through code-specialized experts. A reasoning question will activate logic experts. The `IntentClassifier` — a 10–15M parameter dense encoder — reads the full prompt once at prefill and predicts which experts the MoE will need across the entire generation. They are loaded before the first decode token.
+Most offload runtimes assume the model was originally designed for full VRAM residency, then try to patch storage pressure afterward. On consumer hardware, that usually means the decode loop ends up paying the IO bill over and over again.
 
 ---
 
-## Three-Tier Storage Architecture
+## Chronos in one line
 
+**Move IO into prefill. Move synchronization down to the expert-event level.**
+
+```text
+Conventional MoE decode loop:             Chronos decode loop:
+
+  Token t                                 Prefill (once):
+    -> route -> which expert?               Read the full prompt
+    -> expert in VRAM? no                   IntentClassifier -> predict expert set
+    -> [STALL: SSD->RAM->VRAM, ~40ms]       AsyncLoad: SSD->RAM->VRAM (background)
+    -> compute                              Wait until those experts are ready
+    -> token t+1
+
+  Every token pays the IO tax.            Token t (every token after):
+                                            Prefetch(t+1 expert) -> H2D stream
+                                            forward(t)            compute stream
+                                            wait_for_event(t+1 only)
+                                            [no global sync]
 ```
+
+Two things matter here:
+
+1. **Prefill-time loading**: `PrefillScheduler` and `IntentClassifier` bulk-load predicted experts before the first decode token.
+2. **Per-expert event sync (M3)**: `promote_to_vram(blocking=False)` records a `torch.cuda.Event` on the `_h2d_stream`, and the compute stream waits only on the experts it actually needs. No more `stream.synchronize()` for the whole system.
+
+Under a simulated 30 ms SSD delay, the new path keeps **35 ms+ per token** of pipeline slack compared with the older blocking path.
+
+---
+
+## Three-tier storage (M1: cluster-aware safetensors)
+
+```text
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        VRAM / Metal Unified Memory                      │
-│  ┌─────────────────┐  ┌──────────────────────────────────────────────┐  │
-│  │  Dense Layer 1  │  │  Shared Expert (always resident)             │  │
-│  │  (IntentCLF)    │  │  + Predicted Hot Experts (pre-loaded)        │  │
-│  └─────────────────┘  └──────────────────────────────────────────────┘  │
+│                        VRAM / Metal unified memory                     │
+│  ┌─────────────────┐  ┌──────────────────────────────────────────────┐ │
+│  │  Dense layer 1  │  │  Shared experts (always resident)           │ │
+│  │  (IntentCLF)    │  │  + predicted hot experts (preloaded)        │ │
+│  └─────────────────┘  └──────────────────────────────────────────────┘ │
 └──────────────────────────────────┬──────────────────────────────────────┘
-                                   │  H2D: dedicated CUDA stream (non-blocking)
+                                   │  H2D: dedicated CUDA stream + per-expert event
 ┌──────────────────────────────────▼──────────────────────────────────────┐
-│                         Pinned RAM Buffer                               │
-│         Prefetched expert weights (mmap, page-locked)                   │
-│         AsyncPrefetcher reads here from SSD in background thread        │
+│                         Pinned RAM buffer                              │
+│         Prefetched expert weights (safetensors mmap, page-locked)     │
+│         AsyncPrefetcher pulls data here from SSD in the background    │
 └──────────────────────────────────┬──────────────────────────────────────┘
-                                   │  Sequential read (4KB-aligned, NVMe-optimised)
+                                   │  Read by cluster order
 ┌──────────────────────────────────▼──────────────────────────────────────┐
-│                              NVMe SSD                                   │
-│         All expert weights (quantized, co-occurrence clustered)         │
-│         Experts that activate together are stored adjacent on disk      │
+│                              NVMe SSD                                  │
+│   One .ctsr file = one Louvain cluster of co-activated experts        │
+│   cluster_manifest.json stores the expert -> cluster mapping          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Nothing in this stack blocks the decode loop.** Expert weights travel up this hierarchy asynchronously while computation proceeds. The decode stream never waits for IO.
+`cluster_manifest.json` and `.ctsr` files are produced offline by Louvain clustering. At runtime, Chronos uses `safetensors.safe_open(...).mmap` to bring an entire expert cluster into RAM in one shot, turning random reads into mostly sequential reads.
 
-### What Happens on a Cache Miss
+### Cache misses degrade gracefully instead of stalling
 
-Even the worst case is handled gracefully. If a needed expert is not yet in VRAM:
+Even the worst case does not hard-stop generation:
 
 ```python
-# Soft gating — no Python branch, no graph break under torch.compile
+# Pure tensor math: no Python branch, no graph break under torch.compile
 output = avail[i] * expert_output + (1.0 - avail[i]) * shared_expert_output
 ```
 
-The shared expert (always resident) blends in proportionally. Generation **never stalls**. Quality degrades smoothly and recovers as the expert loads in the background.
+The shared expert is always resident, so generation continues while the missing expert finishes loading in the background. Quality degrades smoothly and recovers automatically once the expert becomes available.
 
 ---
 
-## Dual-Layer Routing: Why Two Predictors?
-
-Most systems use one router. Chronos uses two operating at different timescales:
+## Dual-layer routing with supervised lookahead (M2)
 
 | | IntentClassifier (Layer 1) | LookaheadRouter (Layer 2) |
 |---|---|---|
-| **When** | Once at prefill | Every token during decode |
+| **When it runs** | Once during prefill | Every token during decode |
 | **Input** | Full prompt (up to 512 tokens) | Hidden state after Block 0 |
-| **Output** | Expert set for entire generation | Expert IDs for t+1, t+2 |
-| **Purpose** | Front-load bulk IO before decode | Catch late prediction misses, update prefetch queue |
-| **Parameters** | ~10–15M (trained separately) | ~2M (trained with main model) |
+| **Output** | Expert set for the full generation | Expert IDs for t+1, t+2 |
+| **Training target** | Supervised from real activation logs | **`L_lookahead` supervised by real router decisions at t+k** |
+| **Parameter count** | ~10-15M | ~2M |
 
-They are complementary, not redundant. Layer 1 handles **macro intent** (what kind of task is this?). Layer 2 handles **micro lookahead** (given current context, what's next?).
+Before M2, the lookahead head was just a head with no real supervision. M2 adds a proper objective:
 
----
-
-## Does This Actually Work? Honest Assessment
-
-### What definitively works
-
-- **Zero decode-phase IO for long generations (100+ tokens)**: PrefillScheduler front-loads all expert loading. Once decode starts, VRAM contains exactly the experts needed.
-- **No hard stalls ever**: Soft gating means a cache miss produces a slightly blended output, not a frozen decoder.
-- **VRAM footprint reduction**: Only shared experts + predicted hot experts are resident. A 4-expert-per-layer, 8-layer model needs ~4 experts in VRAM instead of 32.
-- **NVMe bandwidth utilization**: Co-occurrence clustering ensures frequently co-activated experts are adjacent on disk, maximizing sequential read throughput.
-
-### What works conditionally
-
-| Claim | Reality |
-|---|---|
-| "Zero efficiency impact" | Not quite: prefill adds ~50–300ms for the SSD load (varies with NVMe speed and expert count). For **short responses (< 20 tokens)**, this first-token latency increase is noticeable. For long responses, it pays off immediately. |
-| 20+ tokens/s on 4GB VRAM | **Verified at minimind scale (512 hidden, 4 experts)**. Production-scale models (7B+, 64+ experts) need real benchmarking — the architecture is correct but absolute numbers scale with hardware. |
-| IntentClassifier ≥ 85% accuracy | **Requires real activation data to train.** Cold start uses frequency heuristics which are safe but less precise. Accuracy improves as the classifier collects real prompt→activation pairs. |
-| Temporal locality loss improves cache hits | Theoretically sound. λ₂ too large can slightly harm routing quality — use Optuna auto-search to find the Pareto-optimal balance. |
-
-### Why this is architecturally novel
-
-No mainstream inference framework (vLLM, llama.cpp, ollama, TGI) implements predictive prefill-time expert loading. They all use **reactive offload**: the decode loop discovers a cache miss and synchronously loads. Chronos converts that reactive pattern into a **proactive, predictive** one at the model design level — not as a runtime hack.
-
----
-
-## Architecture Overview
-
-```
-Input tokens (full prompt)
-        │
-        ▼
-┌───────────────────────────────────────┐
-│  IntentClassifier (10–15M dense)      │  ← runs ONCE at prefill
-│  Reads entire prompt → IntentVector   │
-└───────────────────┬───────────────────┘
-                    │
-                    ▼
-┌───────────────────────────────────────┐
-│  ExpertPredictor                      │
-│  IntentVector → ExpertSet             │
-│  (threshold + VRAM budget cap)        │
-└───────────────────┬───────────────────┘
-                    │
-                    ▼
-┌───────────────────────────────────────┐   ┌─────────────────────────┐
-│  PrefillScheduler                     │──▶│  AsyncLoader thread     │
-│  Batch-loads predicted experts        │   │  SSD → pinned RAM       │
-│  Waits for load complete              │   │  → VRAM (dedicated      │
-└───────────────────┬───────────────────┘   │    CUDA stream)         │
-                    │                        └─────────────────────────┘
-                    ▼
-    Decode loop (zero IO, full speed)
-        │
-        ├─ Block 0: MLAAttention
-        │     └─ LookaheadRouter → predict t+1, t+2 experts
-        │           └─ AsyncPrefetcher: schedule background load
-        │
-        ├─ Block 1–N: SlidingWindowAttention / MLAAttention (alternating)
-        │
-        └─ ChronosMOEFeedForward
-              ├─ Expert in VRAM?  → compute directly
-              └─ Cache miss?      → soft blend with Shared Expert
+```text
+L_lookahead = (1 / K) * sum_{k=1..K} CE(stopgrad(real_router_{t+k}), lookahead_pred_t^(k))
 ```
 
-### Loss Function
-
-$$L_{\text{total}} = L_{\text{CE}} + \lambda_1 L_{\text{balance}} + \lambda_2 \sum_{t=2}^{T} \| E_t - E_{t-1} \|_2^2$$
-
-The temporal locality term $\lambda_2$ **trains the model to prefer routing stability across adjacent tokens** — not just for loss minimization, but because stable routing means the same experts stay hot in cache. Both λ values are automatically tuned via **Optuna TPE** Bayesian optimization.
+That turns the lookahead router into an actual predictor of future routing, instead of a best-effort heuristic.
 
 ---
 
-## Storage-Tier Awareness: What's Different vs. Other Frameworks
+## Full training stack: Stage 1 -> Stage 6
+
+Each stage has its own entry script, and every one of them inherits the shared Chronos loss mixer: balance loss, temporal locality loss, lookahead loss, and, for alignment stages, a router KL anchor that keeps RL/DPO updates from destroying cache locality.
+
+| Stage | Script | Core objective | Router KL anchor (default lambda) |
+|---|---|---|---|
+| 1 Pretrain | `train_chronos.py` | CE + balance + temporal + lookahead | 0.0 (off) |
+| 2 SFT | `train_chronos_sft.py` | SFT loss + shared Chronos mix | 0.01 (weak) |
+| 3 DPO | `train_chronos_dpo.py` | DPO `log-sigma(beta * logits)` + mix | 0.10 (strong) |
+| 4 ORPO | `train_chronos_orpo.py` | NLL + lambda * ORPO term | 0.10 |
+| 5 GRPO | `train_chronos_grpo.py` | `PG * A - beta * KL` with `ToyReward` or pluggable `LMRewardModel` | 0.10 |
+| 6 Distill | `train_chronos_distill.py` | `alpha * T^2 * KL(student || teacher) + (1 - alpha) * CE` | 0.05 |
+
+The full six-stage comparison harness lives in `tools/compare_minimind_chronos_v3.py`.
+
+---
+
+## Backend dispatch (M5)
+
+```python
+from chronos.backend import BackendDispatcher
+
+d = BackendDispatcher()
+d.available()   # ['mlx', 'mps', 'cpu'] on Apple Silicon
+                # ['cuda', 'cpu']        on NVIDIA hosts
+d.select()      # choose the best available backend automatically
+d.describe()    # human-readable capability summary
+```
+
+- **First-class backends for training and inference**: `cpu`, `mps`, `cuda`, `mlx`
+- **Inference-only / experimental**: `vulkan` when PyTorch was custom-built with `USE_VULKAN=ON`
+- **Third-party extension hook**: `opencl`, via `chronos/backend/ext/opencl.py:PROBE()`
+
+Honest note: upstream PyTorch does not ship a real OpenCL backend, and Vulkan support is still niche. Chronos provides a dispatcher seam so external integrations can plug in cleanly without touching core code.
+
+---
+
+## Hugging Face and vLLM compatibility (M5)
+
+- `ChronosForCausalLM` subclasses `PreTrainedModel` and registers `AutoConfig` and `AutoModelForCausalLM`, so loading does **not** require `trust_remote_code`:
+
+  ```python
+  from transformers import AutoModelForCausalLM
+
+  model = AutoModelForCausalLM.from_pretrained("./out_dir")
+  ```
+
+- `chronos.model.hf_io.save_chronos_pretrained` and `load_chronos_pretrained` emit standard `model.safetensors` + `config.json`, while also carrying `cluster_manifest.json` and `.ctsr` files for expert-cache layout. Roundtrip logit drift is `0.00e+00`.
+
+- `chronos.serving.register_chronos_with_vllm()` registers Chronos with the vLLM `ModelRegistry` when vLLM is installed. If vLLM is absent, it prints an install hint and exits cleanly. Worker-side mask injection is documented in [docs/vllm_integration.md](docs/vllm_integration.md).
+
+---
+
+## Compared with existing offload stacks
 
 | Feature | llama.cpp offload | vLLM offload | **Project Chronos** |
 |---|---|---|---|
-| Expert prediction | None (reactive) | None (reactive) | **Predictive (IntentCLF + Lookahead)** |
-| IO timing | During decode (blocking) | During decode (blocking) | **During prefill (async, pre-emptive)** |
-| Cache miss behavior | Hard stall | Hard stall | **Soft gating (zero stall)** |
-| Training integration | Post-hoc patch | Post-hoc patch | **Native loss term (temporal locality)** |
-| Disk layout | Model order | Model order | **Co-occurrence clustered** |
-| CUDA stream isolation | No | Partial | **Dedicated H2D stream** |
-| Apple Silicon (MLX) | No | No | **Native MLX backend** |
+| Expert prediction | None | None | **Predictive (`IntentCLF` + `LookaheadRouter`)** |
+| Lookahead training | n/a | n/a | **Supervised `L_lookahead` (M2)** |
+| IO timing | During decode, blocking | During decode, blocking | **During prefill, async** |
+| Decode pipeline | Synchronous | Synchronous | **Dual-stream + per-expert events (M3)** |
+| Cache miss behavior | Hard stall | Hard stall | **Soft gating, zero hard stall** |
+| Disk format | GGUF | safetensors | **Cluster-packed safetensors (`.ctsr`)** |
+| Training integration | Post-hoc patch | Post-hoc patch | **Native six-stage stack + router KL anchor** |
+| Backend dispatch | Compile-time fixed | CUDA only | **`cpu` / `mps` / `cuda` / `mlx` + extension hooks** |
+| Apple Silicon support | Partial | No | **Full MLX backend** |
+| Hugging Face compatibility | GGUF only | Yes | **Yes, with expert-cache metadata** |
+| vLLM compatibility | n/a | Native | **Optional adapter** |
 
 ---
 
-## Performance
+## Objective
 
-> **Note**: Systematic benchmark comparisons are pending (Phase 5). The following reflects design expectations and small-scale experiments, not yet a rigorous controlled study.
+```text
+L_total = L_base
+        + lambda_bal * L_balance
+        + lambda_tmp * L_temporal
+        + lambda_LA  * L_lookahead
+        + lambda_anc * L_router_KL_anchor
+```
 
-| Metric | Standard MoE (offload) | Project Chronos |
-|---|---|---|
-| Decode throughput (VRAM-limited) | Blocked by per-token IO | IO front-loaded to prefill; decode runs at compute bound |
-| KV cache @ 1K tokens | ~500 MB | **~30 MB** (MLA + SlidingWindow) — verified |
-| Cache miss penalty | Hard stall 30–80ms | **Zero stall** (soft blend) — verified by design |
-| VRAM footprint | All experts or OOM | Shared + predicted hot only |
-| First token latency | Fast (no preload) | +latency proportional to SSD speed × predicted expert count |
-| Accuracy degradation | 0% baseline | Expected ~2–5%; needs measurement |
+- `L_base`: stage-specific objective (`CE`, `DPO`, `ORPO`, `GRPO`, or distillation)
+- `L_temporal = (1 / T) * sum_{t=2..T} ||E_t - E_{t-1}||_2^2`: encourages adjacent tokens to reuse similar experts
+- `L_lookahead = (1 / K) * sum_{k=1..K} CE(stopgrad(P_{t+k}), Q_t^(k))`: supervises the lookahead head
+- `L_router_KL_anchor = KL(pi_theta^router || pi_pretrain^router)`: keeps alignment-stage updates from destroying the routing layout learned during pretraining
+
+All lambda terms are searchable with Optuna TPE, together with structural hyperparameters such as `hidden_size`, `num_experts`, and `kv_latent_dim`.
 
 ---
 
-## Installation (Not Ready in PyPI Yet)
+## Installation
 
 ```bash
 pip install project-chronos
@@ -216,21 +214,28 @@ pip install -e ".[dev]"
 ```
 
 **MLX (Apple Silicon):**
+
 ```bash
 pip install "project-chronos[mlx]"
 ```
 
+**vLLM serving (optional, Linux + CUDA only):**
+
+```bash
+pip install vllm
+```
+
 > **minimind dependency**: Project Chronos uses [minimind](https://github.com/jingyaogong/minimind) as its MoE kernel.
-> If not found locally, it is automatically cloned to `~/.cache/chronos/minimind-master/` on first import.
-> minimind is licensed under **Apache-2.0**. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+> If it is not found locally, Chronos clones it automatically into `~/.cache/chronos/minimind-master/` on first import.
+> minimind is licensed under **Apache-2.0**. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution details.
 
 **Requirements**: Python 3.10+, PyTorch 2.1+
 
 ---
 
-## Quick Start
+## Quick start
 
-### Web UI
+### Web UI (M6: 7 tabs, 4 languages)
 
 ```bash
 chronos-ui
@@ -238,58 +243,91 @@ chronos-ui
 python chronos_app.py
 ```
 
-### Train
+Tabs included:
+
+- `Config` with a live parameter / memory estimator merged in from the old Designer
+- `Train` with its own `data_path`
+- `6-Stage Pipeline` with per-stage dataset paths
+- `Inference`
+- `Benchmark` with Markdown table + bar plot
+- `Auto-Tune` with persistent logs and one-click `Apply Best -> Config`
+- `IO Monitor`
+
+Built-in i18n: `zh-Hans`, `zh-Hant`, `en`, `ja`
+
+### Stage 1: pretrain
 
 ```bash
-chronos train \
-    --data_path ./dataset/pretrain.jsonl \
-    --hidden_size 512 \
-    --num_hidden_layers 8 \
-    --num_experts 4 \
-    --lambda_temporal 1e-3 \
-    --epochs 2 \
-    --device cuda:0
+python train_chronos.py \
+    --data_path ./tests/fixtures/tiny_pretrain.jsonl \
+    --hidden_size 256 --num_hidden_layers 4 --num_experts 4 \
+    --epochs 1 --device cpu --save_dir ./out
 ```
 
-### Validate Lookahead Accuracy (Phase 1)
+### Stage 2-5: alignment chain
 
 ```bash
-chronos eval \
-    --data_path ./dataset/eval.jsonl \
-    --model_path ./out/chronos_512_moe.pth \
-    --device cuda
+python train_chronos_sft.py  --data_path ./tests/fixtures/tiny_sft.jsonl  --from_weight chronos --save_dir ./out --device cpu
+python train_chronos_dpo.py  --data_path ./tests/fixtures/tiny_dpo.jsonl  --from_weight sft     --save_dir ./out --device cpu
+python train_chronos_orpo.py --data_path ./tests/fixtures/tiny_dpo.jsonl  --from_weight sft     --save_dir ./out --device cpu
+python train_chronos_grpo.py --data_path ./tests/fixtures/tiny_grpo.jsonl --from_weight orpo    --save_dir ./out --device cpu \
+    --reward toy   # or lm:/path/to/reward-model
 ```
 
-```
-=== Phase 1 Validation: LookaheadRouter Accuracy ===
-  top1_acc_t+1: 0.873  ✓ PASS (target: ≥85%)
-  top1_acc_t+2: 0.761  ✓ PASS (target: ≥75%)
-  mean_l2_routing_shift: 0.0312
-  Phase 1 Gate: PASS ✓
-```
-
-### Cluster Expert Layout (Maximize Sequential SSD Read)
+### Stage 6: distillation
 
 ```bash
-chronos export \
-    --model_path ./out/chronos_512_moe.pth \
-    --data_path  ./dataset/calib.jsonl \
-    --output_dir ./expert_cache_clustered
+python train_chronos_distill.py \
+    --data_path ./tests/fixtures/tiny_sft.jsonl \
+    --teacher_path ./out/sft_192_moe.pth \
+    --from_weight grpo --save_dir ./out --device cpu \
+    --alpha 0.7 --temperature 4.0
 ```
 
-### Automatic λ Search
+### End-to-end comparison (minimind vs Chronos)
+
+```bash
+python tools/compare_minimind_chronos_v3.py \
+    --pretrain_steps 150 --align_steps 30 --distill_steps 30 \
+    --simulated_ssd_ms 30 --device cpu \
+    --output results/compare_results_v3.json
+```
+
+This emits per-stage loss, HF roundtrip logit delta, tokens/sec, active-expert ratio, resident-expert bytes, M3 pipeline slack, and the backend inventory on the current host.
+
+### Cluster-pack expert storage for sequential SSD reads
+
+```python
+from chronos.io.cluster_layout import (
+    collect_activation_log,
+    build_cooccurrence_matrix,
+    try_louvain_clustering,
+    repack_expert_weights_safetensors,
+)
+
+log = collect_activation_log(model, calib_loader, "cpu", max_batches=50)
+clusters = try_louvain_clustering(build_cooccurrence_matrix(log, num_experts))
+repack_expert_weights_safetensors(model, clusters, "./expert_cache_clustered")
+```
+
+### Search lambdas and structure hyperparameters automatically
 
 ```python
 from chronos.tuning.chronos_auto_tuner import ChronosAutoTuner, ChronosSearchSpaceConfig
 
 tuner = ChronosAutoTuner()
 tuner.start(
-    model_id="./out/chronos_512_moe.pth",
+    model_id="./out/chronos_256_moe.pth",
     dataset_path="./dataset/train.jsonl",
     search_space=ChronosSearchSpaceConfig(
-        tune_lambda_temporal=True,
         tune_lambda_balance=True,
+        tune_lambda_temporal=True,
+        tune_lambda_lookahead=True,
         tune_lookahead_steps=True,
+        tune_hidden_size=True,
+        tune_num_experts=True,
+        tune_num_shared_experts=True,
+        tune_kv_latent_dim=True,
     ),
     n_trials=20,
 )
@@ -297,76 +335,109 @@ tuner.start(
 
 ---
 
-## Project Structure
+## Project layout
 
-```
+```text
 Project_Chronos/
 ├── chronos/
-│   ├── deps.py                    # Auto-download minimind if not found locally
+│   ├── deps.py                    # Auto-download minimind if missing
+│   ├── __init__.py                # AutoConfig / AutoModelForCausalLM registration
 │   ├── model/
 │   │   ├── config.py              # ChronosConfig
 │   │   ├── hybrid_attention.py    # MLAAttention + SlidingWindowAttention
-│   │   ├── lookahead_router.py    # Per-token lookahead predictor (Layer 2)
-│   │   ├── moe_chronos.py         # ChronosMOEFeedForward + Shared Expert + soft gating
+│   │   ├── lookahead_router.py    # Per-token lookahead predictor
+│   │   ├── moe_chronos.py         # ChronosMOEFeedForward + shared experts + soft gating
 │   │   ├── model_chronos.py       # ChronosForCausalLM
-│   │   └── temporal_loss.py       # Temporal locality loss
+│   │   ├── temporal_loss.py       # Temporal locality + lookahead losses
+│   │   └── hf_io.py               # save/load_chronos_pretrained + HF registration
 │   ├── io/
-│   │   ├── expert_store.py        # Three-tier storage, dedicated CUDA H2D stream
-│   │   ├── async_prefetcher.py    # Background SSD→RAM prefetch engine
-│   │   └── cluster_layout.py      # Co-occurrence clustering for SSD layout
+│   │   ├── expert_store.py        # Three-tier storage + per-expert events
+│   │   ├── async_prefetcher.py    # Async prefetch engine
+│   │   ├── storage.py             # ClusterStorage: .ctsr safetensors + manifest
+│   │   ├── cluster_layout.py      # Co-occurrence clustering + repacking
+│   │   └── io_simulator.py        # CHRONOS_SIM_SSD_MS test hook
 │   ├── router/
-│   │   ├── intent_classifier.py   # Prompt-level expert predictor (Layer 1, ~10M params)
-│   │   ├── expert_predictor.py    # IntentVector → ExpertSet with budget cap
-│   │   └── prefill_scheduler.py   # Orchestrates batch preload before decode
-│   ├── mlx/                       # Native Apple Silicon backend
-│   │   ├── attention.py           # MLX MLA + SlidingWindow
-│   │   ├── moe.py                 # MLX MoE with soft gating
-│   │   ├── model.py               # ChronosMLXModel
-│   │   ├── expert_store.py        # MLXExpertStore (unified memory)
-│   │   └── inference.py           # ChronosMLXInferenceEngine
+│   │   ├── intent_classifier.py   # Prompt-level expert predictor
+│   │   ├── expert_predictor.py    # IntentVector -> ExpertSet
+│   │   └── prefill_scheduler.py   # Prefill-time expert preloader
+│   ├── mlx/
+│   │   ├── attention.py / moe.py / model.py / expert_store.py / inference.py
 │   ├── runtime/
-│   │   ├── cache_manager.py       # Unified cache interface
-│   │   └── inference_engine.py    # End-to-end inference (PyTorch)
+│   │   ├── cache_manager.py       # prefetch_for_next_step / ensure_resident
+│   │   ├── inference_engine.py    # End-to-end inference engine
+│   │   └── metrics.py             # MetricsBus for the IO Monitor
+│   ├── trainer/
+│   │   ├── loss_mixin.py          # chronos_loss_term + router_kl_anchor
+│   │   ├── chronos_trainer.py     # Pretrain
+│   │   ├── sft_trainer.py         # Stage 2
+│   │   ├── dpo_trainer.py         # Stage 3
+│   │   ├── orpo_trainer.py        # Stage 4
+│   │   ├── grpo_trainer.py        # Stage 5
+│   │   ├── distill_trainer.py     # Stage 6
+│   │   └── reward.py              # ToyReward / LMRewardModel / build_reward_fn
 │   ├── tuning/
-│   │   └── chronos_auto_tuner.py  # Optuna λ search
+│   │   └── chronos_auto_tuner.py  # Optuna lambda + architecture search
 │   ├── eval/
-│   │   ├── io_profiler.py         # Phase 1 validation
-│   │   └── benchmark.py           # End-to-end benchmark
+│   │   ├── io_profiler.py         # Lookahead validation
+│   │   └── benchmark.py           # End-to-end benchmarking
 │   ├── data/
-│   │   └── flexible_dataset.py    # Auto-detects any JSONL field format
-│   ├── backend.py                 # Auto-detect MLX / CUDA / MPS / CPU
+│   │   └── flexible_dataset.py    # Flexible JSONL dataset loader
+│   ├── backend/
+│   │   ├── __init__.py            # BackendDispatcher (cpu/mps/cuda/mlx)
+│   │   ├── dispatcher.py          # Capability probing + priority logic
+│   │   └── ext/opencl.py          # Third-party OpenCL extension hook
+│   ├── _backend_legacy.py         # Backward-compatible older APIs
+│   ├── serving/
+│   │   ├── __init__.py
+│   │   └── vllm_adapter.py        # Optional vLLM registration
 │   └── cli.py                     # Unified CLI
-├── ui/                            # Gradio Web UI (4-language i18n)
-├── chronos_app.py                 # Web UI entry point
-├── train_chronos.py               # Training entry point
-├── tests/test_smoke.py
+├── ui/                            # Gradio Web UI (zh-Hans / zh-Hant / en / ja)
+│   ├── i18n.py
+│   ├── estimator.py               # Live parameter / memory estimator
+│   └── tabs/
+│       ├── config_tab.py          # Config + Designer merged together
+│       ├── train_tab.py           # Owns data_path
+│       ├── pipeline_tab.py        # Per-stage datasets across all 6 stages
+│       ├── inference_tab.py
+│       ├── benchmark_tab.py       # Markdown table + gr.BarPlot
+│       ├── autotune_tab.py        # Persistent logs + Apply Best -> Config
+│       └── iomon_tab.py           # MetricsBus dashboard
+├── chronos_app.py                 # Web UI entry
+├── train_chronos.py               # Stage 1 entry
+├── train_chronos_sft.py           # Stage 2 entry
+├── train_chronos_dpo.py           # Stage 3 entry
+├── train_chronos_orpo.py          # Stage 4 entry
+├── train_chronos_grpo.py          # Stage 5 entry
+├── train_chronos_distill.py       # Stage 6 entry
+├── tools/
+│   ├── compare_minimind_chronos.py
+│   ├── compare_minimind_chronos_v2.py
+│   └── compare_minimind_chronos_v3.py
+├── tests/
+│   ├── test_smoke.py
+│   ├── test_smoke_cuda.py
+│   └── fixtures/
+├── docs/
+│   └── vllm_integration.md
 ├── pyproject.toml
-└── README.md
+└── README.md / README_zh.md / THIRD_PARTY_NOTICES.md
 ```
-
----
-
-## Third-Party Attribution
-
-Project Chronos builds on [minimind](https://github.com/jingyaogong/minimind) by **jingyaogong**, licensed under **Apache-2.0**.
-
-Key components derived from minimind:
-- `MiniMindConfig` → extended as `ChronosConfig`
-- `MOEFeedForward` → extended as `ChronosMOEFeedForward`
-- `Attention`, `RMSNorm`, `apply_rotary_pos_emb` → used in hybrid attention modules
-- Training loop structure → adapted in `ChronosTrainer`
-
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for complete attribution and license compatibility analysis.
 
 ---
 
 ## Roadmap
 
-- [x] Phase 1: LookaheadRouter + TemporalLocalityLoss
-- [x] Phase 2: Async I/O engine + three-tier storage + co-occurrence clustering
+- [x] Phase 1: LookaheadRouter + temporal locality loss
+- [x] Phase 2: Async IO engine + three-tier storage + co-occurrence clustering
 - [x] Phase 3: Hybrid attention (MLA + SlidingWindow) + PrefillScheduler + dual-layer routing
-- [x] Phase 4: Native MLX backend, Web UI, CLI, Optuna λ search, open-source release
-- [ ] Phase 5: Train IntentClassifier on large activation corpus; benchmark on 7B+ scale models
+- [x] Phase 4: Native MLX backend, Web UI, CLI, Optuna search, open-source release
+- [x] M1: cluster-aware safetensors storage
+- [x] M2: supervised lookahead loss (`L_lookahead`)
+- [x] M3: dual-stream decode pipeline with per-expert events
+- [x] M4: full SFT / DPO / ORPO / GRPO trainers + router KL anchor
+- [x] M5: HF safetensors IO + AutoModel registration + vLLM adapter + multi-backend dispatch + Stage 6 distillation + pluggable reward model
+- [x] M6: Web UI v2 (merged Config + Designer, per-stage datasets, persistent autotune log, Apply Best, benchmark bar plot, IO Monitor)
+- [ ] Phase 5: Train `IntentClassifier` on large activation corpora, benchmark 7B+ models, inject masks on the vLLM worker path, and ship real Vulkan / OpenCL kernels
 
 ---
 
@@ -384,6 +455,12 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for complete attribution an
 
 ---
 
+## Third-party attribution
+
+Project Chronos builds on **jingyaogong**'s [minimind](https://github.com/jingyaogong/minimind), licensed under **Apache-2.0**. Full attribution lives in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+---
+
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE)
+Apache 2.0 - see [LICENSE](LICENSE)

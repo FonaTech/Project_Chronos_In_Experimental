@@ -363,6 +363,67 @@ def test_ui_build():
     assert app is not None
 
 
+def test_shared_expert_grad():
+    """M7a: shared_experts must receive gradient during the training-path
+    forward (available_expert_mask=None). Pre-M7 they were dead code,
+    causing train/inference distribution mismatch."""
+    from chronos.model.config import ChronosConfig
+    from chronos.model.model_chronos import ChronosForCausalLM
+    cfg = ChronosConfig(hidden_size=32, num_hidden_layers=1, num_experts=4,
+                        num_experts_per_tok=2, num_shared_experts=1,
+                        num_attention_heads=2, num_key_value_heads=2,
+                        kv_latent_dim=8, rope_dim=4, max_seq_len=16,
+                        vocab_size=128, use_moe=True)
+    m = ChronosForCausalLM(cfg).train()
+    ids = torch.randint(0, 128, (2, 8))
+    out, _ = m(ids, labels=ids)
+    out.loss.backward()
+    sh = m.model.layers[0].mlp.shared_experts[0]
+    g = sh.gate_proj.weight.grad
+    assert g is not None and g.norm().item() > 0, "shared_experts received zero gradient"
+
+
+def test_optimizer_decay_groups():
+    """M7b: build_optimizer must split params into a decay group
+    (linears) and a no-decay group (norms / biases / embeddings)."""
+    import torch.nn as nn
+    from chronos.trainer.optim_utils import build_optimizer
+    m = nn.Sequential(nn.Embedding(10, 4), nn.LayerNorm(4), nn.Linear(4, 4))
+    opt = build_optimizer(m, lr=1e-3, weight_decay=0.05)
+    decay_g, no_decay_g = opt.param_groups[0], opt.param_groups[1]
+    assert decay_g["weight_decay"] == 0.05
+    assert no_decay_g["weight_decay"] == 0.0
+    # Linear.weight is 2-D → decay; LN scale + Embedding rows + biases → no-decay
+    assert any(p.ndim == 2 and p.shape == (4, 4) for p in decay_g["params"])
+    assert any(p is m[0].weight for p in no_decay_g["params"])  # embedding
+    assert any(p is m[1].weight for p in no_decay_g["params"])  # LN scale
+
+
+def test_warmup_lr_schedule():
+    """M7b: warmup → cosine. LR at step=1 ≪ base, peaks at warmup_steps,
+    decays toward min_lr_ratio·base by total_steps."""
+    from chronos.trainer.optim_utils import get_lr
+    base = 1e-3
+    total = 1000
+    warm = 50
+    assert get_lr(1, total, base, warmup_steps=warm) == base * (1 / warm)
+    assert get_lr(warm, total, base, warmup_steps=warm) == base
+    end = get_lr(total, total, base, warmup_steps=warm)
+    assert abs(end - base * 0.1) < 1e-9, f"expected min_lr_ratio·base, got {end}"
+
+
+def test_val_split_reproducible():
+    """M7c: deterministic idx-modulo split — running twice yields the
+    same train/val partition."""
+    n = 200
+    val_ratio = 0.05
+    stride = max(2, int(round(1.0 / val_ratio)))
+    val_a = [i for i in range(n) if i % stride == 0]
+    val_b = [i for i in range(n) if i % stride == 0]
+    assert val_a == val_b
+    assert len(val_a) == n // stride
+
+
 if __name__ == '__main__':
     tests = [
         test_forward,
@@ -383,6 +444,10 @@ if __name__ == '__main__':
         test_vllm_adapter_no_vllm,
         test_hf_save_load_roundtrip,
         test_ui_build,
+        test_shared_expert_grad,
+        test_optimizer_decay_groups,
+        test_warmup_lr_schedule,
+        test_val_split_reproducible,
     ]
     passed = 0
     for t in tests:

@@ -97,20 +97,26 @@ def build_config_tab():
         with gr.Row():
             preset_dd = gr.Dropdown(
                 choices=preset_names(),
-                value="MiniMind-MoE (default)",
-                label="Preset",
+                value="Recommended-CN (≈120M)",
+                label=t("config.preset"),
                 scale=2,
             )
-            apply_preset_btn = gr.Button("📥 Load Preset", variant="secondary", scale=1)
-            reset_btn = gr.Button("↻ Reset to MiniMind-MoE", variant="secondary", scale=1)
+            register_translatable(preset_dd, "config.preset")
+            apply_preset_btn = gr.Button(t("config.load_preset"), variant="secondary", scale=1)
+            register_translatable(apply_preset_btn, "config.load_preset")
+            reset_btn = gr.Button(t("config.reset_minimind"), variant="secondary", scale=1)
+            register_translatable(reset_btn, "config.reset_minimind")
         with gr.Row():
             cfg_path = gr.Textbox(
                 value="./out/chronos_config.json",
-                label="Config file path (.json)",
+                label=t("config.cfg_path"),
                 scale=3,
             )
-            save_btn = gr.Button("💾 Save Config to File", variant="primary", scale=1)
-            load_btn = gr.Button("📂 Load Config from File", variant="primary", scale=1)
+            register_translatable(cfg_path, "config.cfg_path")
+            save_btn = gr.Button(t("config.save_cfg"), variant="primary", scale=1)
+            register_translatable(save_btn, "config.save_cfg")
+            load_btn = gr.Button(t("config.load_cfg"), variant="primary", scale=1)
+            register_translatable(load_btn, "config.load_cfg")
         save_status = gr.Markdown("", visible=True)
 
         with gr.Row():
@@ -140,30 +146,39 @@ def build_config_tab():
                     register_translatable(sliding_window, "config.sliding_window")
 
                 with gr.Row():
-                    num_heads        = gr.Slider(1, 256, value=D["num_attention_heads"], step=1, label="num_attention_heads")
-                    num_kv_heads     = gr.Slider(1, 256, value=D["num_key_value_heads"], step=1, label="num_key_value_heads")
-                    rope_dim         = gr.Slider(*RANGES["rope_dim"],      value=D["rope_dim"], label="rope_dim")
+                    num_heads        = gr.Slider(1, 256, value=D["num_attention_heads"], step=1, label=t("config.num_attn_heads"))
+                    num_kv_heads     = gr.Slider(1, 256, value=D["num_key_value_heads"], step=1, label=t("config.num_kv_heads"))
+                    rope_dim         = gr.Slider(*RANGES["rope_dim"],      value=D["rope_dim"], label=t("config.rope_dim"))
                     moe_intermediate = gr.Slider(
                         0, 65536, value=D["moe_intermediate_size"], step=8,
-                        label="moe_intermediate_size (0 = auto: ceil(H·π/64)·64)",
+                        label=t("config.moe_inter"),
                     )
+                    register_translatable(num_heads,        "config.num_attn_heads")
+                    register_translatable(num_kv_heads,     "config.num_kv_heads")
+                    register_translatable(rope_dim,         "config.rope_dim")
+                    register_translatable(moe_intermediate, "config.moe_inter")
 
                 with gr.Row():
-                    vocab_size = gr.Number(value=D["vocab_size"], precision=0, label="vocab_size")
+                    vocab_size = gr.Number(value=D["vocab_size"], precision=0, label=t("config.vocab_size"))
                     dtype      = gr.Dropdown(
                         choices=["fp32", "bf16", "fp16", "int8", "nf4"],
-                        value=D["dtype"], label="dtype",
+                        value=D["dtype"], label=t("config.dtype"),
                     )
-                    tie_word_embeddings = gr.Checkbox(value=D["tie_word_embeddings"], label="tie_word_embeddings")
+                    tie_word_embeddings = gr.Checkbox(value=D["tie_word_embeddings"], label=t("config.tie_emb"))
+                    register_translatable(vocab_size,          "config.vocab_size")
+                    register_translatable(dtype,               "config.dtype")
+                    register_translatable(tie_word_embeddings, "config.tie_emb")
 
                 gr.Markdown(f"### {t('config.loss')}")
                 with gr.Row():
                     lambda_balance       = gr.Number(value=D["lambda_balance"],       label=t("config.lambda_balance"),  precision=6)
                     lambda_temporal      = gr.Number(value=D["lambda_temporal"],      label=t("config.lambda_temporal"), precision=6)
-                    lambda_lookahead     = gr.Number(value=D["lambda_lookahead"],     label="λ lookahead",      precision=6)
-                    lambda_router_anchor = gr.Number(value=D["lambda_router_anchor"], label="λ router-anchor",  precision=6)
-                    register_translatable(lambda_balance,  "config.lambda_balance")
-                    register_translatable(lambda_temporal, "config.lambda_temporal")
+                    lambda_lookahead     = gr.Number(value=D["lambda_lookahead"],     label=t("config.lambda_la"),       precision=6)
+                    lambda_router_anchor = gr.Number(value=D["lambda_router_anchor"], label=t("config.lambda_anchor"),   precision=6)
+                    register_translatable(lambda_balance,        "config.lambda_balance")
+                    register_translatable(lambda_temporal,       "config.lambda_temporal")
+                    register_translatable(lambda_lookahead,      "config.lambda_la")
+                    register_translatable(lambda_router_anchor,  "config.lambda_anchor")
 
                 gr.Markdown(f"### {t('config.hw')}")
                 with gr.Row():
@@ -171,10 +186,11 @@ def build_config_tab():
                     pinned_frac     = gr.Slider(0.01, 0.95,  value=D["pinned_memory_max_fraction"], step=0.01,  label=t("config.pinned_frac"))
                     use_hybrid_attn = gr.Checkbox(value=D["use_hybrid_attention"], label=t("config.hybrid_attn"))
                     storage_format  = gr.Dropdown(choices=["safetensors", "pt"], value=D["storage_format"],
-                                                  label="storage_format")
+                                                  label=t("config.storage_format"))
                     register_translatable(vram_budget,     "config.vram_budget")
                     register_translatable(pinned_frac,     "config.pinned_frac")
                     register_translatable(use_hybrid_attn, "config.hybrid_attn")
+                    register_translatable(storage_format,  "config.storage_format")
 
                 gr.Markdown(f"### {t('config.train')}")
                 with gr.Row():

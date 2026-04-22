@@ -9,7 +9,7 @@ Mirrors ChronosInferenceEngine (PyTorch) but uses:
 
 Usage:
     engine = ChronosMLXInferenceEngine(model, config)
-    for token_id in engine.generate("Once upon a time", max_new_tokens=128):
+    for token_id in engine.generate("Explain how Chronos moves expert IO into prefill.", max_new_tokens=128):
         print(tokenizer.decode([token_id]), end="", flush=True)
 """
 import threading

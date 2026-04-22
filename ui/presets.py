@@ -37,7 +37,7 @@ MINIMIND_MOE_DEFAULTS: Dict = {
 
     # MoE
     "num_experts":           4,
-    "num_experts_per_tok":   1,
+    "num_experts_per_tok":   2,        # M8c: top-2 doubles activated params at fixed total params
     "num_shared_experts":    1,        # Chronos extension; minimind has no shared
 
     # Attention shape (Chronos hybrid)
@@ -88,6 +88,22 @@ CONFIG_INPUT_ORDER: List[str] = [
 # Named presets — keys are user-facing labels (also used in the dropdown).
 PRESETS: Dict[str, Dict] = {
     "MiniMind-MoE (default)": dict(MINIMIND_MOE_DEFAULTS),
+
+    # M8c: "Recommended-CN" — sized for the /Users/Fona/Downloads/Hybrid_LLM/Dataset
+    # 1.3 GB pretrain corpus. Previously the default 15M-param model
+    # (H=256, L=4, E=4, topk=1 → ~6M activated) was far below the size
+    # needed for coherent Chinese output (empirically ~100M activated).
+    # This preset targets ~120M total / ~60M activated params at vocab=6400.
+    "Recommended-CN (≈120M)": {
+        **MINIMIND_MOE_DEFAULTS,
+        "hidden_size": 512, "num_hidden_layers": 8, "num_experts": 8,
+        "num_experts_per_tok": 2, "num_shared_experts": 1,
+        "num_attention_heads": 8, "num_key_value_heads": 2,
+        "kv_latent_dim": 64, "rope_dim": 32, "sliding_window_size": 2048,
+        "max_seq_len": 512, "batch_size": 8, "accumulation_steps": 8,
+        "epochs": 1, "save_interval": 500,
+        "learning_rate": 3e-4,
+    },
 
     "Tiny (smoke / CI)": {
         **MINIMIND_MOE_DEFAULTS,
@@ -141,7 +157,7 @@ def values_in_input_order(cfg: Dict) -> List:
     # Values chosen to match the slider minima where applicable.
     SAFE = {
         "hidden_size": 768, "num_hidden_layers": 8,
-        "num_experts": 4, "num_experts_per_tok": 1, "num_shared_experts": 1,
+        "num_experts": 4, "num_experts_per_tok": 2, "num_shared_experts": 1,
         "lookahead_steps": 2, "kv_latent_dim": 64, "sliding_window_size": 2048,
         "num_attention_heads": 8, "num_key_value_heads": 4, "rope_dim": 32,
         "moe_intermediate_size": 0, "vocab_size": 6400,

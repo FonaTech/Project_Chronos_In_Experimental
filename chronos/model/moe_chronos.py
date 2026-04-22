@@ -42,6 +42,12 @@ class ChronosMOEFeedForward(nn.Module):
             for _ in range(config.num_shared_experts)
         ])
         self.aux_loss = torch.zeros(1)
+        # raw, *unscaled* load-balance value computed in forward(). The
+        # trainer-side λ_balance lives in chronos_loss_term so we don't
+        # double-scale (router_aux_loss_coef × λ_balance gave a 2 000×
+        # under-weighting and let the gate degenerate). Set to None until
+        # the first training forward populates it.
+        self.aux_loss_raw: torch.Tensor = None
         # Stores routing probs for downstream loss / metrics.
         # We keep TWO refs:
         #   last_router_probs       — detached, safe for logging / cluster
@@ -93,7 +99,8 @@ class ChronosMOEFeedForward(nn.Module):
         y = torch.zeros_like(x_flat)
 
         if available_expert_mask is None:
-            # --- Training path: standard MoE dispatch ---
+            # --- Training path: standard MoE dispatch + always-on shared expert ---
+            dead_param_sum = None
             for i, expert in enumerate(self.experts):
                 mask = (topk_idx == i)
                 if mask.any():
@@ -101,13 +108,39 @@ class ChronosMOEFeedForward(nn.Module):
                     weight = topk_weight[mask].view(-1, 1)
                     y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
                 elif self.training:
-                    y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+                    # Dead-expert handling: keep the autograd edge alive
+                    # WITHOUT touching y[0,0] (the previous trick poisoned
+                    # the BOS position every step). We accumulate a
+                    # 0·sum(params) scalar that gets routed into aux_loss
+                    # below, which the trainer always backprops on.
+                    contrib = sum(p.sum() for p in expert.parameters())
+                    dead_param_sum = (
+                        contrib if dead_param_sum is None else dead_param_sum + contrib
+                    )
 
-            if self.training and self.router_aux_loss_coef > 0:
+            # Always-on shared expert (mirrors the inference branch). The
+            # previous code only ran shared_experts under the inference
+            # mask path, so during training they received zero gradient
+            # — and at inference, the cache-miss fallback fired untrained
+            # weights, which is the dominant root cause of "loss looks
+            # fine but generations are gibberish."
+            if len(self.shared_experts) > 0:
+                y = y + self._shared_expert_output(x_flat).to(y.dtype)
+
+            if self.training:
+                # Raw, un-scaled load balance (model exposes raw; trainer scales).
                 load = F.one_hot(topk_idx, self.num_experts).float().mean(0)
-                self.aux_loss = (load * scores.mean(0)).sum() * self.num_experts * self.router_aux_loss_coef
+                aux_raw = (load * scores.mean(0)).sum() * self.num_experts
+                if dead_param_sum is not None:
+                    aux_raw = aux_raw + 0.0 * dead_param_sum
+                self.aux_loss_raw = aux_raw
+                # Backwards-compat: the legacy `aux_loss` field stays
+                # populated with the pre-scaled value some callers still
+                # read (chronos_loss_term now prefers aux_loss_raw).
+                self.aux_loss = aux_raw * self.router_aux_loss_coef
             else:
-                self.aux_loss = scores.new_zeros(1).squeeze()
+                self.aux_loss_raw = scores.new_zeros(())
+                self.aux_loss = scores.new_zeros(())
 
         else:
             # --- Inference path: compile-safe soft gating ---

@@ -20,7 +20,7 @@ def build_inference_tab(config_state: gr.State):
 
         prompt = gr.Textbox(
             label=t("infer.prompt"), lines=4,
-            placeholder="Once upon a time..."
+            placeholder="Explain how Chronos handles expert prefetch during prefill..."
         )
         register_translatable(prompt, "infer.prompt")
 

@@ -21,12 +21,13 @@ from torch import optim
 from torch.utils.data import DataLoader
 
 import chronos.deps  # noqa
-from trainer.trainer_utils import get_lr, Logger, is_main_process  # type: ignore
+from trainer.trainer_utils import Logger, is_main_process  # type: ignore
 from chronos.data.flexible_dataset import StreamingDPODataset as DPODataset
 
 from chronos.model.config import ChronosConfig
 from chronos.model.model_chronos import ChronosForCausalLM
 from chronos.model.temporal_loss import lookahead_supervision_loss
+from chronos.trainer.optim_utils import get_lr
 from chronos.trainer.loss_mixin import (
     chronos_loss_term,
     collect_router_probs,
@@ -65,7 +66,11 @@ class ChronosDPOTrainer:
         self.autocast_ctx = nullcontext() if device_type == "cpu" \
             else torch.cuda.amp.autocast(dtype=dtype)
         self.scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
-        self.optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+        from chronos.trainer.optim_utils import build_optimizer
+        self.optimizer = build_optimizer(
+            model, lr=args.learning_rate,
+            weight_decay=float(getattr(args, "weight_decay", 0.01)),
+        )
 
         # Frozen reference model — DPO needs π_ref(y|x). Build a fresh
         # instance and load the current state_dict (deepcopy fails on
@@ -182,4 +187,4 @@ class ChronosDPOTrainer:
 
 def build_dpo_loader(data_path, tokenizer, max_seq_len, batch_size):
     ds = DPODataset(data_path, tokenizer, max_length=max_seq_len)
-    return DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    return DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)

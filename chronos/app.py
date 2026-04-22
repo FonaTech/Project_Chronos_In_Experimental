@@ -32,6 +32,7 @@ from ui.tabs.benchmark_tab import build_benchmark_tab
 from ui.tabs.autotune_tab  import build_autotune_tab
 from ui.tabs.iomon_tab     import build_iomon_tab
 from ui.tabs.pipeline_tab  import build_pipeline_tab
+from ui.tabs.data_tab      import build_data_tab
 
 
 APP_CSS = """
@@ -80,6 +81,7 @@ def build_app() -> gr.Blocks:
             )
 
         config_state, config_inputs, cfg_save_dir = build_config_tab()
+        build_data_tab()
         build_train_tab(config_state, cfg_save_dir)
         build_pipeline_tab()
         build_inference_tab(config_state)

@@ -79,14 +79,15 @@ def build_autotune_tab(config_state: gr.State, config_inputs: list):
         gr.Markdown("### Optuna TPE — search over Chronos hyperparameters")
 
         with gr.Row():
-            data_path   = gr.Textbox(label="data_path (.jsonl)", scale=3,
+            data_path   = gr.Textbox(label=t("autotune.data_path"), scale=3,
                                      placeholder="./tests/fixtures/tiny_pretrain.jsonl")
             n_trials    = gr.Slider(2, 200, value=20, step=1,  label=t("autotune.n_trials"))
             probe_steps = gr.Slider(10, 1000, value=80, step=10, label=t("autotune.probe_steps"))
+            register_translatable(data_path,   "autotune.data_path")
             register_translatable(n_trials,    "autotune.n_trials")
             register_translatable(probe_steps, "autotune.probe_steps")
 
-        gr.Markdown("**Tick which hyperparameters to search:**")
+        gr.Markdown(t("autotune.tip"))
         with gr.Row():
             t_lb = gr.Checkbox(value=True,  label="λ1 balance")
             t_lt = gr.Checkbox(value=True,  label="λ2 temporal")
@@ -102,10 +103,12 @@ def build_autotune_tab(config_state: gr.State, config_inputs: list):
         with gr.Row():
             start_btn = gr.Button(t("autotune.start"), variant="primary")
             stop_btn  = gr.Button(t("autotune.stop"),  variant="stop")
-            clear_btn = gr.Button("Clear log file")
-            apply_btn = gr.Button("Apply Best → Config", variant="secondary")
+            clear_btn = gr.Button(t("autotune.clear_log"))
+            apply_btn = gr.Button(t("autotune.apply_best"), variant="secondary")
             register_translatable(start_btn, "autotune.start")
             register_translatable(stop_btn,  "autotune.stop")
+            register_translatable(clear_btn, "autotune.clear_log")
+            register_translatable(apply_btn, "autotune.apply_best")
 
         status_box = gr.Textbox(value="idle", label="Status", interactive=False)
         best_box   = gr.JSON(label=t("autotune.best"))

@@ -11,8 +11,9 @@ from contextlib import nullcontext
 
 from model.model_minimind import MiniMindConfig
 from trainer.trainer_utils import (
-    get_lr, Logger, is_main_process, lm_checkpoint, setup_seed,
+    Logger, is_main_process, lm_checkpoint, setup_seed,
 )
+from chronos.trainer.optim_utils import get_lr  # warmup→cosine override
 from chronos.data.flexible_dataset import (
     FlexibleDataset as PretrainDataset,
     StreamingSFTDataset as SFTDataset,
@@ -38,6 +39,9 @@ class ChronosTrainer:
         self.config = config
         self.args = args
         self.device = args.device
+        seed = getattr(args, "seed", None)
+        if seed is not None:
+            setup_seed(int(seed))
         device_type = "cuda" if "cuda" in self.device else "cpu"
         dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
         self.autocast_ctx = (
@@ -47,8 +51,10 @@ class ChronosTrainer:
         self.scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
 
         self.model = ChronosForCausalLM(config).to(self.device)
-        self.optimizer = optim.AdamW(
-            self.model.parameters(), lr=args.learning_rate
+        from chronos.trainer.optim_utils import build_optimizer
+        self.optimizer = build_optimizer(
+            self.model, lr=args.learning_rate,
+            weight_decay=float(getattr(args, "weight_decay", 0.01)),
         )
 
     def _collect_router_probs(self) -> torch.Tensor:

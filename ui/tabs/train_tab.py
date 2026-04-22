@@ -9,7 +9,51 @@ import queue
 import gradio as gr
 
 import chronos.deps  # auto-bootstrap minimind on sys.path
-from ui.i18n import t, register_translatable
+from ui.i18n import t, register_translatable, get_current_lang
+
+
+DEFAULT_STAGE_SAMPLE_PROMPTS = {
+    "pretrain": {
+        "zh-Hans": "请用简洁中文介绍 Project Chronos 如何把 MoE 的专家加载提前到 Prefill 阶段。",
+        "zh-Hant": "請用精簡中文介紹 Project Chronos 如何把 MoE 的專家載入提前到 Prefill 階段。",
+        "en": "Explain how Project Chronos moves MoE expert loading into the prefill stage.",
+        "ja": "Project Chronos が MoE の専門家ロードを Prefill 段階へ前倒しする仕組みを説明してください。",
+    },
+    "sft": {
+        "zh-Hans": "用户：为什么 Chronos 的双层路由比传统被动 offload 更适合消费级硬件？\n助手：",
+        "zh-Hant": "使用者：為什麼 Chronos 的雙層路由比傳統被動 offload 更適合消費級硬體？\n助手：",
+        "en": "User: Why is Chronos's dual-layer routing better suited to consumer hardware than reactive expert offload?\nAssistant:",
+        "ja": "ユーザー: なぜ Chronos の二層ルーティングは、従来の受動的な expert offload よりも民生向けハードウェアに向いているのですか？\nアシスタント:",
+    },
+    "rl": {
+        "zh-Hans": "请比较 Chronos 与传统 MoE offload 在吞吐、首 token 延迟和缓存未命中行为上的权衡。",
+        "zh-Hant": "請比較 Chronos 與傳統 MoE offload 在吞吐、首 token 延遲和快取未命中行為上的權衡。",
+        "en": "Compare Chronos with conventional MoE offload in terms of throughput, first-token latency, and cache-miss behavior.",
+        "ja": "Chronos と従来の MoE offload を、スループット、初回トークン遅延、キャッシュミス時の挙動で比較してください。",
+    },
+    "orpo": {
+        "zh-Hans": "请写一段更适合 README 首页的英文介绍，突出 Predictive Prefill、Soft Gating 和 6-stage training pipeline。",
+        "zh-Hant": "請寫一段更適合 README 首頁的英文介紹，突出 Predictive Prefill、Soft Gating 和 6-stage training pipeline。",
+        "en": "Write a README-ready intro that highlights predictive prefill, soft gating, and the 6-stage training pipeline.",
+        "ja": "predictive prefill、soft gating、6-stage training pipeline を強調した README 向けの紹介文を書いてください。",
+    },
+}
+
+
+def _stage_sample_prompt(mode: str, lang: str | None = None) -> str:
+    lang = lang or get_current_lang()
+    prompts = DEFAULT_STAGE_SAMPLE_PROMPTS.get(mode, DEFAULT_STAGE_SAMPLE_PROMPTS["pretrain"])
+    return prompts.get(lang, prompts["en"])
+
+
+def _default_sample_prompts() -> set[str]:
+    vals: set[str] = set()
+    for prompts in DEFAULT_STAGE_SAMPLE_PROMPTS.values():
+        vals.update(v.strip() for v in prompts.values() if v and v.strip())
+    return vals
+
+
+DEFAULT_SAMPLE_PROMPT_VALUES = _default_sample_prompts()
 
 
 def _sniff_checkpoint(path: str) -> dict:
@@ -85,6 +129,9 @@ class TrainSession:
         # Progress + ETA — set when training kicks off
         self.total_steps: int = 0
         self.t_start: float = 0.0
+        # M8a: live generation sample (updated each save_interval).
+        self.last_sample: str = ""
+        self.last_sample_step: int = 0
 
     def is_running(self):
         return self._thread is not None and self._thread.is_alive()
@@ -278,19 +325,25 @@ class TrainSession:
             )
             self._put(f"Device: {device}")
             model = model.to(device)
-            optimizer = optim.AdamW(model.parameters(), lr=cfg.get("learning_rate", 5e-4))
+            from chronos.trainer.optim_utils import build_optimizer, get_lr, apply_lr
+            base_lr = float(cfg.get("learning_rate", 5e-4))
+            weight_decay = float(cfg.get("weight_decay", 0.01))
+            optimizer = build_optimizer(model, lr=base_lr, weight_decay=weight_decay)
 
             data_path = cfg.get("data_path", "")
             max_seq_len = cfg.get("max_seq_len", 512)
             batch_size = cfg.get("batch_size", 4)
-            accum = cfg.get("accumulation_steps", 8)
+            accum = max(1, int(cfg.get("accumulation_steps", 8)))
             epochs = cfg.get("epochs", 1)
             save_interval = cfg.get("save_interval", 500)
             log_interval = max(1, cfg.get("log_interval", 10))
+            val_ratio = float(cfg.get("val_ratio", 0.05))
+            max_steps = int(cfg.get("max_steps", 0)) or None  # 0 => no cap
 
             if not data_path or not os.path.exists(data_path):
                 self._put("No dataset found — running synthetic smoke test (50 steps)")
                 loader = self._synthetic_loader(model_cfg.vocab_size, max_seq_len, batch_size, n=50)
+                val_loader = None
             else:
                 tokenizer = self._load_tokenizer()
                 # Streaming JSONL — O(N · 8B) RSS regardless of corpus size.
@@ -301,26 +354,65 @@ class TrainSession:
                     FlexibleDataset, StreamingSFTDataset,
                 )
                 if mode == "pretrain":
-                    ds = FlexibleDataset(data_path, tokenizer, max_length=max_seq_len)
+                    full_ds = FlexibleDataset(data_path, tokenizer, max_length=max_seq_len)
                 else:
-                    ds = StreamingSFTDataset(data_path, tokenizer, max_length=max_seq_len)
-                loader = DataLoader(ds, batch_size=batch_size, shuffle=True,
+                    full_ds = StreamingSFTDataset(data_path, tokenizer, max_length=max_seq_len)
+                # Deterministic val split: every 1/val_ratio-th record goes to val
+                # (idx-modulo split → reproducible without rescanning the file).
+                if val_ratio > 0 and len(full_ds) >= 20:
+                    stride = max(2, int(round(1.0 / val_ratio)))
+                    val_idx   = [i for i in range(len(full_ds)) if i % stride == 0]
+                    train_idx = [i for i in range(len(full_ds)) if i % stride != 0]
+                    from torch.utils.data import Subset
+                    train_ds = Subset(full_ds, train_idx)
+                    val_ds   = Subset(full_ds, val_idx)
+                    self._put(f"Split: train={len(train_ds)}  val={len(val_ds)}")
+                else:
+                    train_ds, val_ds = full_ds, None
+                loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                                     num_workers=0, pin_memory=False)
+                val_loader = (
+                    DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                               num_workers=0, pin_memory=False)
+                    if val_ds is not None else None
+                )
 
             model.train()
             global_step = 0
             step_t = time.monotonic()
-            # Steps remaining for ETA / progress bar
+            best_val = float("inf")
+            best_path = ckp_path.replace(".pth", ".best.pth")
+            # Steps remaining for ETA / progress bar — respect max_steps cap.
             try:
-                self.total_steps = max(1, len(loader) * epochs)
+                planned = max(1, len(loader) * epochs)
             except Exception:
-                self.total_steps = 0
+                planned = 0
+            self.total_steps = min(planned, max_steps) if (max_steps and planned) else (planned or (max_steps or 0))
 
+            def _eval_val() -> float:
+                if val_loader is None:
+                    return float("nan")
+                model.eval()
+                tot, n = 0.0, 0
+                with torch.no_grad():
+                    for k, (vx, vy) in enumerate(val_loader):
+                        if k >= 50:  # cap eval cost
+                            break
+                        vx = vx.to(device); vy = vy.to(device)
+                        vout, _ = model(vx, labels=vy)
+                        tot += float(vout.loss.item()); n += 1
+                model.train()
+                return tot / max(n, 1)
+
+            stop_outer = False
             for epoch in range(epochs):
-                if self._stop.is_set():
+                if self._stop.is_set() or stop_outer:
                     break
-                for step, (input_ids, labels) in enumerate(loader):
+                for step, (input_ids, labels) in enumerate(loader, start=1):
                     if self._stop.is_set():
+                        break
+                    if max_steps and global_step >= max_steps:
+                        stop_outer = True
                         break
                     input_ids = input_ids.to(device)
                     labels = labels.to(device)
@@ -358,6 +450,14 @@ class TrainSession:
                     self.step = global_step
                     self.loss = loss.item()
 
+                    # LR schedule (warmup → cosine). Refresh every step.
+                    sched_total = self.total_steps or planned or (global_step + 1)
+                    apply_lr(optimizer, get_lr(global_step, sched_total, base_lr))
+
+                    # Optimizer.step() once per `accum` micro-batches.
+                    # Off-by-one fix: trigger when (global_step % accum == 0).
+                    # Previous code did the same check but had no warmup-aware
+                    # accumulation count, occasionally stepping after step 1.
                     if global_step % accum == 0:
                         import torch.nn as nn
                         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -375,7 +475,7 @@ class TrainSession:
                             f"Epoch {epoch+1}/{epochs}  Step {global_step}  "
                             f"loss={tot_val:.4f}  ce={ce_val:.4f}  "
                             f"aux={aux_val:.4f}  temporal={temp_val:.4f}  "
-                            f"steps/s={tps:.2f}"
+                            f"steps/s={tps:.2f}  lr={optimizer.param_groups[0]['lr']:.2e}"
                         )
                         self._put_metric({
                             "step": global_step,
@@ -393,6 +493,52 @@ class TrainSession:
                             ckp_path
                         )
                         self._put(f"Saved checkpoint → {ckp_path}")
+
+                        # Validation eval + best-ckpt tracking.
+                        v = _eval_val()
+                        if v == v:  # not NaN
+                            self._put(f"Validation loss: {v:.4f}  (best={best_val:.4f})")
+                            self._put_metric({
+                                "step": global_step, "total": v, "ce": v,
+                                "aux": 0.0, "temporal": 0.0, "tps": 0.0,
+                                "val": True,
+                                "val_loss": v,
+                            })
+                            if v < best_val:
+                                best_val = v
+                                torch.save(
+                                    {k: vv.half().cpu() for k, vv in model.state_dict().items()},
+                                    best_path,
+                                )
+                                self._put(f"  ↑ new best → {best_path}")
+
+                        # M8a: live qualitative sample so the user sees
+                        # whether the model is actually learning, not just
+                        # whether the loss number went down. We greedy-decode
+                        # ~80 tokens from the user-supplied prompt, and fall
+                        # back to a stage-aware evaluation prompt if blank.
+                        try:
+                            sp = (cfg.get("sample_prompt") or "").strip()
+                            if not sp:
+                                sp = _stage_sample_prompt(mode)
+                            tokenizer = self._load_tokenizer()
+                            ids = tokenizer.encode(sp, return_tensors="pt").to(device)
+                            model.eval()
+                            with torch.no_grad():
+                                gen = ids.clone()
+                                for _ in range(80):
+                                    o, _ = model(gen, use_cache=False)
+                                    nxt = o.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                                    gen = torch.cat([gen, nxt], dim=-1)
+                                    if int(nxt.item()) == (tokenizer.eos_token_id or -1):
+                                        break
+                            txt = tokenizer.decode(gen[0].tolist(), skip_special_tokens=True)
+                            model.train()
+                            self.last_sample = txt
+                            self.last_sample_step = global_step
+                            self._put(f"[sample @ step {global_step}] {txt[:200]}")
+                        except Exception as gen_err:
+                            self._put(f"[sample failed: {gen_err}]")
 
             os.makedirs(save_dir, exist_ok=True)
             torch.save(
@@ -460,6 +606,12 @@ def _make_loss_chart(metrics: list[dict], total_steps: int = 0, t_start: float =
         remaining = (total_steps - cur_step) / rate if rate > 0 and total_steps else float("nan")
         progress_pct = min(100.0, 100.0 * cur_step / total_steps) if total_steps else 0.0
 
+        # M8b: split val markers from train metrics.
+        train_metrics = [m for m in metrics if not m.get("val")]
+        val_metrics   = [m for m in metrics if m.get("val")]
+        train_steps = [m["step"] for m in train_metrics]
+        val_steps   = [m["step"] for m in val_metrics]
+
         fig, axes = plt.subplots(1, 3, figsize=(13, 3.5),
                                  gridspec_kw={"width_ratios": [4, 3, 3]})
         fig.patch.set_facecolor("#1a1a2e")
@@ -467,10 +619,14 @@ def _make_loss_chart(metrics: list[dict], total_steps: int = 0, t_start: float =
         # ── Left: loss curves
         ax = axes[0]
         ax.set_facecolor("#16213e")
-        ax.plot(steps, [m["total"] for m in metrics],    color="#e94560", lw=1.5, label="total")
-        ax.plot(steps, [m["ce"] for m in metrics],       color="#0f3460", lw=1.2, label="ce")
-        ax.plot(steps, [m["aux"] for m in metrics],      color="#533483", lw=1.2, label="aux")
-        ax.plot(steps, [m["temporal"] for m in metrics], color="#e2b714", lw=1.0, label="temporal", ls="--")
+        if train_metrics:
+            ax.plot(train_steps, [m["total"] for m in train_metrics],    color="#e94560", lw=1.5, label="train total")
+            ax.plot(train_steps, [m["ce"] for m in train_metrics],       color="#0f3460", lw=1.2, label="train ce")
+            ax.plot(train_steps, [m["aux"] for m in train_metrics],      color="#533483", lw=1.0, label="aux")
+            ax.plot(train_steps, [m["temporal"] for m in train_metrics], color="#e2b714", lw=0.9, label="temporal", ls="--")
+        if val_metrics:
+            ax.plot(val_steps, [m["ce"] for m in val_metrics], color="#39d98a",
+                    lw=2.0, marker="o", markersize=4, label="val ce")
         ax.set_title("Loss Curves", color="white", fontsize=11)
         ax.set_xlabel("Step", color="#aaa")
         ax.tick_params(colors="#aaa")
@@ -478,11 +634,14 @@ def _make_loss_chart(metrics: list[dict], total_steps: int = 0, t_start: float =
             spine.set_edgecolor("#333")
         ax.legend(fontsize=8, facecolor="#16213e", labelcolor="white")
 
-        # ── Middle: throughput
+        # ── Middle: throughput (only train rows have tps)
         ax2 = axes[1]
         ax2.set_facecolor("#16213e")
-        ax2.plot(steps, [m["tps"] for m in metrics], color="#00b4d8", lw=1.5)
-        ax2.fill_between(steps, [m["tps"] for m in metrics], alpha=0.2, color="#00b4d8")
+        tps_steps = [m["step"] for m in train_metrics if m.get("tps", 0) > 0]
+        tps_vals  = [m["tps"]  for m in train_metrics if m.get("tps", 0) > 0]
+        if tps_steps:
+            ax2.plot(tps_steps, tps_vals, color="#00b4d8", lw=1.5)
+            ax2.fill_between(tps_steps, tps_vals, alpha=0.2, color="#00b4d8")
         ax2.set_title("Throughput (steps/s)", color="white", fontsize=11)
         ax2.set_xlabel("Step", color="#aaa")
         ax2.tick_params(colors="#aaa")
@@ -562,10 +721,37 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
         # ── Init-weight: required for SFT/RL/ORPO, optional for pretrain ──
         with gr.Row():
             init_weight = gr.Textbox(
-                label="init_weight (.pth) — required for SFT / RL / ORPO; optional resume for pretrain",
-                placeholder="./out/chronos_768_moe.pth   (auto-falls-back to prior stage)",
+                label=t("train.init_weight"),
+                placeholder="./out/chronos_768_moe.pth",
                 scale=4,
             )
+            register_translatable(init_weight, "train.init_weight")
+
+        with gr.Row():
+            max_steps_in = gr.Number(
+                value=0, precision=0,
+                label=t("train.max_steps"), scale=1,
+            )
+            val_ratio_in = gr.Slider(
+                0.0, 0.5, value=0.05, step=0.01,
+                label=t("train.val_ratio"), scale=2,
+            )
+            weight_decay_in = gr.Number(
+                value=0.01, precision=4,
+                label=t("train.weight_decay"), scale=1,
+            )
+            register_translatable(max_steps_in,    "train.max_steps")
+            register_translatable(val_ratio_in,    "train.val_ratio")
+            register_translatable(weight_decay_in, "train.weight_decay")
+
+        with gr.Row():
+            sample_prompt_in = gr.Textbox(
+                value=_stage_sample_prompt("pretrain"),
+                label=t("train.sample_prompt"),
+                placeholder=_stage_sample_prompt("pretrain"),
+                scale=4,
+            )
+            register_translatable(sample_prompt_in, "train.sample_prompt")
 
         with gr.Row():
             start_btn = gr.Button(t("train.start"), variant="primary")
@@ -599,16 +785,36 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
         )
         register_translatable(log_box, "train.log")
 
+        # ── Live generation sample (updated each save_interval) ───
+        sample_box = gr.Textbox(
+            label=t("train.sample_output"), lines=6,
+            interactive=False, autoscroll=False,
+        )
+        register_translatable(sample_box, "train.sample_output")
+
         # ── Callbacks ─────────────────────────────────────────────
 
-        def start_training(cfg, train_mode, dpath, iw):
+        def sync_sample_prompt(train_mode, current_prompt):
+            current = (current_prompt or "").strip()
+            if (not current) or current in DEFAULT_SAMPLE_PROMPT_VALUES:
+                return gr.update(
+                    value=_stage_sample_prompt(train_mode),
+                    placeholder=_stage_sample_prompt(train_mode),
+                )
+            return gr.update(placeholder=_stage_sample_prompt(train_mode))
+
+        def start_training(cfg, train_mode, dpath, iw, ms, vr, wd, sp):
             if _session.is_running():
-                return "already running", 0, 0.0, 0.0, 0.0, 0.0, "Already running.\n", None
+                return "already running", 0, 0.0, 0.0, 0.0, 0.0, "Already running.\n", None, ""
             cfg = dict(cfg) if cfg else {}
             cfg["data_path"] = dpath or cfg.get("data_path", "")
             cfg["init_weight"] = iw or ""
+            cfg["max_steps"] = int(ms or 0)
+            cfg["val_ratio"] = float(vr or 0.0)
+            cfg["weight_decay"] = float(wd or 0.0)
+            cfg["sample_prompt"] = sp or ""
             _session.start(cfg, train_mode)
-            return "running", 0, 0.0, 0.0, 0.0, 0.0, "Starting...\n", None
+            return "running", 0, 0.0, 0.0, 0.0, 0.0, "Starting...\n", None, ""
 
         def stop_training():
             _session.stop()
@@ -650,12 +856,22 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
                 tps_v,
                 combined,
                 fig,
+                _session.last_sample or "",
             )
+
+        mode.change(
+            fn=sync_sample_prompt,
+            inputs=[mode, sample_prompt_in],
+            outputs=[sample_prompt_in],
+        )
 
         start_btn.click(
             fn=start_training,
-            inputs=[config_state, mode, data_path, init_weight],
-            outputs=[status_box, step_box, loss_box, ce_box, aux_box, tps_box, log_box, chart],
+            inputs=[config_state, mode, data_path, init_weight,
+                    max_steps_in, val_ratio_in, weight_decay_in,
+                    sample_prompt_in],
+            outputs=[status_box, step_box, loss_box, ce_box, aux_box, tps_box,
+                     log_box, chart, sample_box],
         )
         stop_btn.click(fn=stop_training, outputs=[status_box])
         clear_btn.click(fn=clear_log, outputs=[log_box])
@@ -663,8 +879,9 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
         timer = gr.Timer(value=2.0)
         timer.tick(
             fn=poll,
-            inputs=[log_box],   # pass current log so we can append
-            outputs=[status_box, step_box, loss_box, ce_box, aux_box, tps_box, log_box, chart],
+            inputs=[log_box],
+            outputs=[status_box, step_box, loss_box, ce_box, aux_box, tps_box,
+                     log_box, chart, sample_box],
         )
 
     return tab
