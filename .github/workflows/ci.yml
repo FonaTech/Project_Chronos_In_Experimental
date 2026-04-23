@@ -24,19 +24,18 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu
-          pip install transformers datasets safetensors optuna psutil numpy tqdm
+          pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers datasets safetensors optuna psutil numpy tqdm pytest ruff
           # Install minimind-master as editable dependency
           pip install -e ./minimind-master 2>/dev/null || true
 
       - name: Lint
         run: |
-          pip install ruff
-          ruff check chronos/ train_chronos.py --ignore E501
+          ruff check .
 
       - name: Unit tests
         run: |
-          python -m pytest tests/ -v --tb=short 2>/dev/null || python tests/test_smoke.py
+          python -m pytest tests/ -v --tb=short
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
