@@ -1,19 +1,18 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "Project_Chronos"
 version = "0.1.0"
 description = "On-device low-latency lookahead dual-layer MoE inference — Lookahead Routing + Async Prefetch + Hybrid Attention"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 requires-python = ">=3.10"
 keywords = ["llm", "moe", "inference", "lookahead-routing", "hybrid-attention", "edge-ai"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -42,6 +41,16 @@ chronos-train = "train_chronos:main"
 chronos-eval  = "chronos.eval.io_profiler:main"
 chronos-bench = "chronos.eval.benchmark:main"
 chronos-export = "chronos.io.cluster_layout:main"
+
+[tool.setuptools]
+py-modules = [
+    "train_chronos",
+    "train_chronos_sft",
+    "train_chronos_dpo",
+    "train_chronos_orpo",
+    "train_chronos_grpo",
+    "train_chronos_distill",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
