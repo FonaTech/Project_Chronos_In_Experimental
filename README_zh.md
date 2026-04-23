@@ -131,13 +131,13 @@ flowchart LR
 M2 之前 LookaheadRouter 没有任何监督——只是个未训练的 head。M2 引入：
 
 $$
-\mathcal{L}_{\text{lookahead}}
-= \frac{1}{|\mathcal{K}_{\text{valid}}|}
-\sum_{k \in \mathcal{K}_{\text{valid}}}
+\mathcal{L}_{\mathrm{lookahead}}
+= \frac{1}{|\mathcal{K}_{\mathrm{valid}}|}
+\sum_{k \in \mathcal{K}_{\mathrm{valid}}}
 \mathbb{E}_{b,t}
 \left[
   - \sum_{e=1}^{E}
-  \operatorname{stopgrad}\!\left(P_{b,t+k,e}\right)
+  \mathrm{sg}\!\left(P_{b,t+k,e}\right)
   \log Q_{b,t,e}^{(k)}
 \right].
 $$
@@ -254,24 +254,21 @@ d.describe()       # 人类可读的能力总览
 ## 损失函数（完整形式）
 
 $$
-\begin{aligned}
-\mathcal{L}_{\text{total}}
-&= \mathcal{L}_{\text{base}}
- + \lambda_{\text{bal}} \mathcal{L}_{\text{aux-raw}}
- + \lambda_{\text{tmp}} \mathcal{L}_{\text{temporal}} \\
-&\quad
- + \lambda_{\text{LA}} \mathcal{L}_{\text{lookahead}}
- + \lambda_{\text{anc}} \mathcal{L}_{\text{router-KL-anchor}} .
-\end{aligned}
+\mathcal{L}_{\mathrm{total}}
+= \mathcal{L}_{\mathrm{base}}
++ \lambda_{\mathrm{bal}} \mathcal{L}_{\mathrm{aux}}
++ \lambda_{\mathrm{tmp}} \mathcal{L}_{\mathrm{temporal}}
++ \lambda_{\mathrm{LA}} \mathcal{L}_{\mathrm{lookahead}}
++ \lambda_{\mathrm{anc}} \mathcal{L}_{\mathrm{routerKL}}
 $$
 
 $$
-\mathcal{L}_{\text{aux-raw}}
-= E \sum_{e=1}^{E} \operatorname{load}_e \cdot \overline{p}_e
+\mathcal{L}_{\mathrm{aux}}
+= E \sum_{e=1}^{E} \mathit{load}_e \cdot \overline{p}_e
 $$
 
 $$
-\mathcal{L}_{\text{temporal}}
+\mathcal{L}_{\mathrm{temporal}}
 = \mathbb{E}_{b,t}
 \left[
   \left\| P_{b,t,:} - P_{b,t-1,:} \right\|_2^2
@@ -279,20 +276,20 @@ $$
 $$
 
 $$
-\mathcal{L}_{\text{router-KL-anchor}}
+\mathcal{L}_{\mathrm{routerKL}}
 = D_{\mathrm{KL}}
 \left(
-  \pi_{\theta}^{\text{router}}
-  \,\middle\|\,
-  \pi_{\text{ref}}^{\text{router}}
+  \pi_{\theta}^{\mathrm{router}}
+  \|
+  \pi_{\mathrm{ref}}^{\mathrm{router}}
 \right)
 $$
 
-- $\mathcal{L}_{\text{base}}$：阶段相关目标（CE / DPO / ORPO / GRPO / KD）。
-- $\mathcal{L}_{\text{aux-raw}}$：未缩放的 MoE load-balance 辅助项；Chronos 在 `chronos_loss_term` 中只乘一次 $\lambda_{\text{bal}}$。
-- $\mathcal{L}_{\text{temporal}}$：约束相邻 token 的路由分布不要剧烈跳变，提高专家复用和缓存局部性。
-- $\mathcal{L}_{\text{lookahead}}$：未来真实路由分布到前瞻预测的 soft-target cross entropy。
-- $\mathcal{L}_{\text{router-KL-anchor}}$：对齐阶段锚定 stage 开始时捕获的参考路由分布，防止 RL/DPO/ORPO/GRPO 梯度破坏聚簇布局。
+- $\mathcal{L}_{\mathrm{base}}$：阶段相关目标（CE / DPO / ORPO / GRPO / KD）。
+- $\mathcal{L}_{\mathrm{aux}}$：未缩放的 MoE load-balance 辅助项；Chronos 在 `chronos_loss_term` 中只乘一次 $\lambda_{\mathrm{bal}}$。
+- $\mathcal{L}_{\mathrm{temporal}}$：约束相邻 token 的路由分布不要剧烈跳变，提高专家复用和缓存局部性。
+- $\mathcal{L}_{\mathrm{lookahead}}$：未来真实路由分布到前瞻预测的 soft-target cross entropy。这里 $\mathrm{sg}(\cdot)$ 表示 stop-gradient。
+- $\mathcal{L}_{\mathrm{routerKL}}$：对齐阶段锚定 stage 开始时捕获的参考路由分布，防止 RL/DPO/ORPO/GRPO 梯度破坏聚簇布局。
 
 `λ` 全部支持 Optuna TPE 自动搜索（包括 `hidden_size` / `num_experts` / `kv_latent_dim` 等结构超参）。
 

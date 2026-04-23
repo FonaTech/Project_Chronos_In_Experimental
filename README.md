@@ -137,13 +137,13 @@ flowchart LR
 Before M2, the lookahead head was just a head with no real supervision. M2 adds a proper soft-target objective:
 
 $$
-\mathcal{L}_{\text{lookahead}}
-= \frac{1}{|\mathcal{K}_{\text{valid}}|}
-\sum_{k \in \mathcal{K}_{\text{valid}}}
+\mathcal{L}_{\mathrm{lookahead}}
+= \frac{1}{|\mathcal{K}_{\mathrm{valid}}|}
+\sum_{k \in \mathcal{K}_{\mathrm{valid}}}
 \mathbb{E}_{b,t}
 \left[
   - \sum_{e=1}^{E}
-  \operatorname{stopgrad}\!\left(P_{b,t+k,e}\right)
+  \mathrm{sg}\!\left(P_{b,t+k,e}\right)
   \log Q_{b,t,e}^{(k)}
 \right].
 $$
@@ -262,24 +262,21 @@ Honest note: upstream PyTorch does not ship a real OpenCL backend, and Vulkan su
 ## Objective
 
 $$
-\begin{aligned}
-\mathcal{L}_{\text{total}}
-&= \mathcal{L}_{\text{base}}
- + \lambda_{\text{bal}} \mathcal{L}_{\text{aux-raw}}
- + \lambda_{\text{tmp}} \mathcal{L}_{\text{temporal}} \\
-&\quad
- + \lambda_{\text{LA}} \mathcal{L}_{\text{lookahead}}
- + \lambda_{\text{anc}} \mathcal{L}_{\text{router-KL-anchor}} .
-\end{aligned}
+\mathcal{L}_{\mathrm{total}}
+= \mathcal{L}_{\mathrm{base}}
++ \lambda_{\mathrm{bal}} \mathcal{L}_{\mathrm{aux}}
++ \lambda_{\mathrm{tmp}} \mathcal{L}_{\mathrm{temporal}}
++ \lambda_{\mathrm{LA}} \mathcal{L}_{\mathrm{lookahead}}
++ \lambda_{\mathrm{anc}} \mathcal{L}_{\mathrm{routerKL}}
 $$
 
 $$
-\mathcal{L}_{\text{aux-raw}}
-= E \sum_{e=1}^{E} \operatorname{load}_e \cdot \overline{p}_e
+\mathcal{L}_{\mathrm{aux}}
+= E \sum_{e=1}^{E} \mathit{load}_e \cdot \overline{p}_e
 $$
 
 $$
-\mathcal{L}_{\text{temporal}}
+\mathcal{L}_{\mathrm{temporal}}
 = \mathbb{E}_{b,t}
 \left[
   \left\| P_{b,t,:} - P_{b,t-1,:} \right\|_2^2
@@ -287,20 +284,20 @@ $$
 $$
 
 $$
-\mathcal{L}_{\text{router-KL-anchor}}
+\mathcal{L}_{\mathrm{routerKL}}
 = D_{\mathrm{KL}}
 \left(
-  \pi_{\theta}^{\text{router}}
-  \,\middle\|\,
-  \pi_{\text{ref}}^{\text{router}}
+  \pi_{\theta}^{\mathrm{router}}
+  \| 
+  \pi_{\mathrm{ref}}^{\mathrm{router}}
 \right)
 $$
 
-- $\mathcal{L}_{\text{base}}$: stage-specific objective (`CE`, `DPO`, `ORPO`, `GRPO`, or distillation).
-- $\mathcal{L}_{\text{aux-raw}}$: the unscaled MoE load-balance auxiliary term; Chronos applies $\lambda_{\text{bal}}$ once in `chronos_loss_term`.
-- $\mathcal{L}_{\text{temporal}}$: encourages adjacent tokens to reuse similar expert distributions.
-- $\mathcal{L}_{\text{lookahead}}$: soft-target cross entropy from the real future router distribution to the lookahead prediction.
-- $\mathcal{L}_{\text{router-KL-anchor}}$: keeps alignment-stage updates from destroying the routing layout captured at stage start.
+- $\mathcal{L}_{\mathrm{base}}$: stage-specific objective (`CE`, `DPO`, `ORPO`, `GRPO`, or distillation).
+- $\mathcal{L}_{\mathrm{aux}}$: the unscaled MoE load-balance auxiliary term; Chronos applies $\lambda_{\mathrm{bal}}$ once in `chronos_loss_term`.
+- $\mathcal{L}_{\mathrm{temporal}}$: encourages adjacent tokens to reuse similar expert distributions.
+- $\mathcal{L}_{\mathrm{lookahead}}$: soft-target cross entropy from the real future router distribution to the lookahead prediction. Here $\mathrm{sg}(\cdot)$ means stop-gradient.
+- $\mathcal{L}_{\mathrm{routerKL}}$: keeps alignment-stage updates from destroying the routing layout captured at stage start.
 
 All lambda terms are searchable with Optuna TPE, together with structural hyperparameters such as `hidden_size`, `num_experts`, and `kv_latent_dim`.
 
