@@ -3,7 +3,7 @@ ui/tabs/inference_tab.py — Real-time generation with tokens/s display
 """
 import time
 
-import gradio as gr
+from ui.gradio_compat import gr
 
 import chronos.deps  # auto-bootstrap minimind on sys.path
 from ui.i18n import t, register_translatable

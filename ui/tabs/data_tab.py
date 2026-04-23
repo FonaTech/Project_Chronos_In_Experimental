@@ -21,10 +21,7 @@ import json
 import os
 import statistics
 
-import gradio as gr
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from ui.gradio_compat import gr
 
 import chronos.deps  # noqa: F401
 from ui.i18n import t, register_translatable
@@ -94,6 +91,13 @@ def _scan(path: str, max_records: int = 50_000):
 def _hist(lens):
     if not lens:
         return None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        return None
+
     plt.close("all")
     fig, ax = plt.subplots(figsize=(7, 3))
     fig.patch.set_facecolor("#1a1a2e")

@@ -1,7 +1,7 @@
 """ui/tabs/iomon_tab.py — Live IO/cache metrics monitor."""
 import time
 
-import gradio as gr
+from ui.gradio_compat import gr
 
 from ui.i18n import t, register_translatable
 from chronos.runtime.metrics import bus

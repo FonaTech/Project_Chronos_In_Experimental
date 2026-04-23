@@ -4,7 +4,7 @@ Mirrors the pattern from Auto_Fine_Tuning/ui/i18n.py
 """
 from __future__ import annotations
 from typing import Dict
-import gradio as gr
+from ui.gradio_compat import gr
 
 LANGUAGE_CHOICES = [
     ("简体中文", "zh-Hans"),

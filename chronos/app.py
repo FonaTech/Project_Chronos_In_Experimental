@@ -18,7 +18,7 @@ _pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _pkg_root not in sys.path:
     sys.path.insert(0, _pkg_root)
 
-import gradio as gr
+from ui.gradio_compat import gr
 
 import chronos.deps  # auto-bootstrap minimind
 from ui.i18n import (

@@ -16,7 +16,7 @@ import json
 import os
 import time
 
-import gradio as gr
+from ui.gradio_compat import gr
 
 import chronos.deps  # noqa: F401
 from ui.i18n import t, register_translatable

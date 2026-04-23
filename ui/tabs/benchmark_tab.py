@@ -11,7 +11,7 @@ Renders the comparison_results.json as:
 import json
 import os
 
-import gradio as gr
+from ui.gradio_compat import gr
 import pandas as pd
 
 import chronos.deps  # noqa: F401

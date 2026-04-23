@@ -10,7 +10,7 @@ Data-path is intentionally NOT in this tab — it lives in the Train tab
 (and is per-stage in the Pipeline tab) so each workflow owns its own
 dataset choice. Only save_dir is shared model-wide.
 """
-import gradio as gr
+from ui.gradio_compat import gr
 
 from chronos.model.config import ChronosConfig
 from ui.i18n import t, register_translatable

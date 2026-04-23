@@ -9,7 +9,7 @@ import os
 import subprocess
 import sys
 
-import gradio as gr
+from ui.gradio_compat import gr
 
 from chronos.backend import training_available, resolve_training_device
 from ui.i18n import t, register_translatable
