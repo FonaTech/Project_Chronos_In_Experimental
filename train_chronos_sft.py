@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
+from chronos.backend import resolve_training_device
 from chronos.model.config import ChronosConfig
 from chronos.model.model_chronos import ChronosForCausalLM
 from chronos.trainer.sft_trainer import ChronosSFTTrainer, build_sft_loader
@@ -29,7 +30,7 @@ def main():
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument("--save_interval", type=int, default=10000)
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default="auto")
     p.add_argument("--dtype", default="float16")
     p.add_argument("--hidden_size", type=int, default=256)
     p.add_argument("--num_hidden_layers", type=int, default=4)
@@ -37,6 +38,8 @@ def main():
     p.add_argument("--lambda_router_anchor", type=float, default=0.01,
                    help="SFT default: weak anchor.")
     args = p.parse_args()
+    selected_backend, resolved_device = resolve_training_device(args.device)
+    args.device = resolved_device
 
     cfg = ChronosConfig(
         hidden_size=args.hidden_size,
@@ -58,6 +61,7 @@ def main():
         print(f"[SFT] Loaded pretrain weights from {ckp_path}")
     else:
         print(f"[SFT] No pretrain checkpoint at {ckp_path} — training from random init.")
+    print(f"[SFT] Training backend: {selected_backend}  device={args.device}")
 
     loader = build_sft_loader(args.data_path, tokenizer, args.max_seq_len, args.batch_size)
     trainer = ChronosSFTTrainer(model, cfg, args, tokenizer)

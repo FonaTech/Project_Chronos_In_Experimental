@@ -6,6 +6,7 @@ import chronos.deps  # noqa
 import torch
 from transformers import AutoTokenizer
 
+from chronos.backend import resolve_training_device
 from chronos.model.config import ChronosConfig
 from chronos.model.model_chronos import ChronosForCausalLM
 from chronos.trainer.distill_trainer import ChronosDistillTrainer, build_distill_loader
@@ -28,7 +29,7 @@ def main():
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument("--save_interval", type=int, default=10000)
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default="auto")
     p.add_argument("--dtype", default="float16")
     p.add_argument("--hidden_size", type=int, default=256)
     p.add_argument("--num_hidden_layers", type=int, default=4)
@@ -38,6 +39,8 @@ def main():
     p.add_argument("--temperature", type=float, default=4.0)
     p.add_argument("--lambda_router_anchor", type=float, default=0.05)
     args = p.parse_args()
+    selected_backend, resolved_device = resolve_training_device(args.device)
+    args.device = resolved_device
 
     cfg = ChronosConfig(
         hidden_size=args.hidden_size,
@@ -59,6 +62,7 @@ def main():
         print(f"[Distill] Student: {stu_ckp}")
     else:
         print(f"[Distill] Student: random init ({stu_ckp} not found)")
+    print(f"[Distill] Training backend: {selected_backend}  device={args.device}")
 
     # Load teacher — try Chronos first, then fall back to MiniMind
     teacher = ChronosForCausalLM(cfg).to(args.device)

@@ -92,6 +92,7 @@ class ExpertStore:
     def __init__(self, model, config, ssd_dir: str = "./expert_cache"):
         self.config = config
         self.ssd_dir = ssd_dir
+        self.model = model
         self.device = next(model.parameters()).device
         os.makedirs(ssd_dir, exist_ok=True)
 
@@ -114,6 +115,8 @@ class ExpertStore:
 
         # Estimate VRAM capacity in number of experts
         expert_bytes = self._expert_size_bytes()
+        self._expert_bytes = expert_bytes
+        self._expert_dtype_cached = self._expert_dtype()
         vram_bytes = config.vram_budget_gb * (1024 ** 3)
         # Reserve 50% headroom for shared experts + attention KV cache
         self.vram_capacity = max(1, int(vram_bytes * 0.5 / max(expert_bytes, 1)))
@@ -135,6 +138,7 @@ class ExpertStore:
         # RAM pinned buffers: {expert_id: {layer_idx: tensor_dict}}
         self._ram_buffers: Dict[int, Dict[int, Dict[str, torch.Tensor]]] = {}
         self._ram_lock = threading.Lock()
+        self._offloaded = False
 
         # M3: per-expert H2D events. Every promote_to_vram records an event
         # on _h2d_stream and stores it here; wait_for_experts synchronizes
@@ -174,7 +178,94 @@ class ExpertStore:
         if not self.moe_layers:
             return 0
         expert = self.moe_layers[0].experts[0]
-        return sum(p.numel() * 2 for p in expert.parameters())  # fp16
+        size = sum(p.numel() * 2 for p in expert.parameters())  # fp16
+        if size:
+            return size
+        cached = getattr(self, "_expert_bytes", 0)
+        if cached:
+            return cached
+        # Lazy placeholders deliberately have no parameters. Fall back to the
+        # Chronos FeedForward topology so cache capacities stay meaningful
+        # when experts are replaced before model.to(device).
+        hidden = int(getattr(self.config, "hidden_size", 0) or 0)
+        intermediate = int(getattr(self.config, "moe_intermediate_size", 0) or 0)
+        if hidden and intermediate:
+            return 3 * hidden * intermediate * 2  # gate/up/down, fp16 bytes
+        return 0
+
+    def _expert_dtype(self) -> torch.dtype:
+        if not self.moe_layers:
+            return torch.float16
+        expert = self.moe_layers[0].experts[0]
+        for p in expert.parameters():
+            return p.dtype
+        return getattr(self, "_expert_dtype_cached", torch.float16)
+
+    def _build_live_expert(self):
+        from model.model_minimind import FeedForward
+        return FeedForward(self.config, intermediate_size=self.config.moe_intermediate_size).to(self.device)
+
+    def _build_placeholder_expert(self):
+        from chronos.model.moe_chronos import LazyExpertPlaceholder
+        return LazyExpertPlaceholder(
+            self.config.hidden_size,
+            self.config.moe_intermediate_size,
+            self._expert_dtype(),
+        )
+
+    def _replace_expert_module(self, layer_idx: int, expert_id: int, module: nn.Module):
+        self.moe_layers[layer_idx].experts[expert_id] = module
+
+    @staticmethod
+    def _expert_state_from_checkpoint(
+        state_dict: Dict[str, torch.Tensor],
+        layer_idx: int,
+        expert_id: int,
+    ) -> Dict[str, torch.Tensor]:
+        prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_id}."
+        state = {}
+        for key, val in state_dict.items():
+            if key.startswith(prefix):
+                state[key[len(prefix):]] = val.detach().to(dtype=torch.float16, device="cpu").contiguous()
+        return state
+
+    def offload_from_state_dict(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        clusters: Optional[List[List[int]]] = None,
+        replace_live: bool = True,
+    ):
+        """Write expert weights to SSD directly from a full checkpoint.
+
+        This is the real lazy-load path for CPU/MPS inference: we avoid
+        materializing MoE expert weights into the live model before setup.
+        """
+        if self.storage_format == "safetensors" and clusters is None:
+            # A raw .pth checkpoint has no co-activation cluster layout.
+            # Falling back to one .pt shard per (layer, expert) preserves
+            # true lazy loading; writing a single all-expert .ctsr cluster
+            # would make the first miss pull every expert into RAM.
+            self.storage_format = "pt"
+            self._cluster_storage = None
+
+        for li in range(self.num_layers):
+            for ei in range(self.num_experts):
+                path = self._ssd_path(ei, li)
+                if os.path.exists(path):
+                    continue
+                state = self._expert_state_from_checkpoint(state_dict, li, ei)
+                if state:
+                    torch.save(state, path)
+
+        if replace_live:
+            self.replace_live_experts_with_placeholders()
+
+    def replace_live_experts_with_placeholders(self):
+        """Drop live expert modules from the active model after SSD offload."""
+        for li in range(self.num_layers):
+            for ei in range(self.num_experts):
+                self._replace_expert_module(li, ei, self._build_placeholder_expert())
+        self._offloaded = True
 
     def _ssd_path(self, expert_id: int, layer_idx: int) -> str:
         return os.path.join(self.ssd_dir, f"expert_l{layer_idx}_e{expert_id}.pt")
@@ -203,6 +294,7 @@ class ExpertStore:
                 if not os.path.exists(path):
                     state = {k: v.half().cpu() for k, v in expert.state_dict().items()}
                     torch.save(state, path)
+        self.replace_live_experts_with_placeholders()
 
     def _offload_safetensors(self, clusters: Optional[List[List[int]]]):
         if clusters is None:
@@ -218,6 +310,7 @@ class ExpertStore:
             dtype=torch.float16,
         )
         self._cluster_storage = ClusterStorage(self.ssd_dir)
+        self.replace_live_experts_with_placeholders()
 
     def attach_cluster_manifest(self, manifest_dir: Optional[str] = None):
         """Load (or reload) a cluster_manifest.json. Called by CacheManager
@@ -364,10 +457,10 @@ class ExpertStore:
         with ctx:
             for li, state in layer_states.items():
                 expert = self.moe_layers[li].experts[expert_id]
-                expert.load_state_dict(
-                    {k: v.to(self.device, non_blocking=True) for k, v in state.items()},
-                    strict=False,
-                )
+                if not isinstance(expert, nn.Module) or len(list(expert.parameters())) == 0:
+                    expert = self._build_live_expert()
+                    self._replace_expert_module(li, expert_id, expert)
+                expert.load_state_dict({k: v.to(self.device, non_blocking=True) for k, v in state.items()}, strict=False)
             # Record an event on the H2D stream so consumers can wait on
             # *just this expert* instead of the whole stream.
             if self._h2d_stream is not None:
@@ -409,12 +502,21 @@ class ExpertStore:
         """Write VRAM expert back to RAM buffer before eviction."""
         for li, moe in enumerate(self.moe_layers):
             if expert_id < len(moe.experts):
-                state = {k: v.half().cpu().pin_memory()
-                         for k, v in moe.experts[expert_id].state_dict().items()}
+                state = {}
+                for k, v in moe.experts[expert_id].state_dict().items():
+                    cpu_v = v.detach().to(dtype=torch.float16, device="cpu").contiguous()
+                    try:
+                        state[k] = cpu_v.pin_memory()
+                    except RuntimeError:
+                        # MPS/CPU-only torch builds may reject pinned storage.
+                        # Keeping a normal CPU tensor is still correct; it only
+                        # loses the CUDA non_blocking copy optimization.
+                        state[k] = cpu_v
                 with self._ram_lock:
                     if expert_id not in self._ram_buffers:
                         self._ram_buffers[expert_id] = {}
                     self._ram_buffers[expert_id][li] = state
+                self._replace_expert_module(li, expert_id, self._build_placeholder_expert())
         self.vram_lru.remove(expert_id)
 
     # ── Mask generation ───────────────────────────────────────────

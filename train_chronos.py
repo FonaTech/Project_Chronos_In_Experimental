@@ -19,6 +19,7 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
+from chronos.backend import resolve_training_device
 from trainer.trainer_utils import setup_seed, Logger
 from dataset.lm_dataset import PretrainDataset
 from chronos.model.config import ChronosConfig
@@ -32,7 +33,7 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--learning_rate", type=float, default=5e-4)
-    p.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", type=str, default="auto")
     p.add_argument("--dtype", type=str, default="bfloat16")
     p.add_argument("--accumulation_steps", type=int, default=8)
     p.add_argument("--grad_clip", type=float, default=1.0)
@@ -63,6 +64,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    selected_backend, resolved_device = resolve_training_device(args.device)
+    args.device = resolved_device
     setup_seed(42)
 
     config = ChronosConfig(
@@ -93,6 +96,7 @@ def main():
            f"experts={config.num_experts} shared={config.num_shared_experts} "
            f"lookahead={config.lookahead_steps} "
            f"λ1={config.lambda_balance} λ2={config.lambda_temporal}")
+    Logger(f"Training backend: {selected_backend}  device={args.device}")
 
     for epoch in range(args.epochs):
         iters = len(loader) if args.steps is None else min(int(args.steps), len(loader))

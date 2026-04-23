@@ -123,14 +123,13 @@ class ChronosAutoTuner(AutoTuner):
         probe_steps, output_dir, seed, params, **kwargs
     ) -> float:
         import torch
+        from chronos.backend import resolve_training_device
         from chronos.model.config import ChronosConfig
         from chronos.model.model_chronos import ChronosForCausalLM
         from chronos.model.temporal_loss import total_loss
         from chronos.model.moe_chronos import ChronosMOEFeedForward
 
-        device = "cuda" if torch.cuda.is_available() else (
-            "mps" if torch.backends.mps.is_available() else "cpu"
-        )
+        _, device = resolve_training_device("auto")
         lr = params.get("learning_rate", 2e-4)
         lb = params.get("lambda_balance", 5e-4)
         lt = params.get("lambda_temporal", 1e-3)

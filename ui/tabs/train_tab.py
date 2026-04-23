@@ -1,15 +1,155 @@
 """
-ui/tabs/train_tab.py — Full training loop: Pretrain / SFT / RL / ORPO
+ui/tabs/train_tab.py — Full training loop: Pretrain / SFT / DPO / ORPO / GRPO / Distill
 """
 import os
 import time
 import threading
 import queue
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import gradio as gr
 
 import chronos.deps  # auto-bootstrap minimind on sys.path
 from ui.i18n import t, register_translatable, get_current_lang
+from chronos.backend import training_available, resolve_training_device
+
+
+STAGE_UI_ORDER = ["pretrain", "sft", "dpo", "orpo", "grpo", "distill"]
+STAGE_LABELS = {
+    "pretrain": "Stage 1 · Pretrain",
+    "sft": "Stage 2 · SFT",
+    "dpo": "Stage 3 · DPO",
+    "orpo": "Stage 4 · ORPO",
+    "grpo": "Stage 5 · GRPO",
+    "distill": "Stage 6 · Distill",
+}
+STAGE_CHECKPOINT_PREFIX = {
+    "pretrain": "chronos",
+    "sft": "sft",
+    "dpo": "dpo",
+    "orpo": "orpo",
+    "grpo": "grpo",
+    "distill": "distill",
+}
+STAGE_DEFAULT_INIT = {
+    "sft": "chronos",
+    "dpo": "sft",
+    "orpo": "sft",
+    "grpo": "orpo",
+    "distill": "grpo",
+}
+STAGE_DEFAULT_DATA = {
+    "pretrain": "./tests/fixtures/tiny_pretrain.jsonl",
+    "sft": "./tests/fixtures/tiny_sft.jsonl",
+    "dpo": "./tests/fixtures/tiny_dpo.jsonl",
+    "orpo": "./tests/fixtures/tiny_dpo.jsonl",
+    "grpo": "./tests/fixtures/tiny_grpo.jsonl",
+    "distill": "./tests/fixtures/tiny_sft.jsonl",
+}
+STAGE_HELP_TEXT = {
+    "pretrain": {
+        "zh-Hans": "从通用语料继续预训练。`init_weight` 可留空；若存在同名 checkpoint，将按当前拓扑尝试恢复。",
+        "zh-Hant": "從通用語料繼續預訓練。`init_weight` 可留空；若存在同名 checkpoint，將按目前拓撲嘗試恢復。",
+        "en": "Continue base pretraining on LM-style data. `init_weight` may be left blank; if a matching checkpoint exists, Train will resume from it.",
+        "ja": "汎用コーパスで事前学習を続けます。`init_weight` は空で構いません。同名 checkpoint があり拓撲が一致すれば再開します。",
+    },
+    "sft": {
+        "zh-Hans": "使用 `conversations` 数据做监督微调。`init_weight` 留空时，会从当前 `save_dir` 自动接续 `chronos_<H>_moe.pth`；只有手动填路径时才覆盖。",
+        "zh-Hant": "使用 `conversations` 資料做監督微調。`init_weight` 留空時，會從目前 `save_dir` 自動接續 `chronos_<H>_moe.pth`；只有手動填路徑時才覆蓋。",
+        "en": "Run supervised fine-tuning on `conversations` data. If `init_weight` is blank, Train auto-resolves `chronos_<H>_moe.pth` from the current `save_dir`; only a pasted path overrides it.",
+        "ja": "`conversations` データで SFT を行います。`init_weight` を空欄にすると、現在の `save_dir` から `chronos_<H>_moe.pth` を自動解決します。パスを入力した場合のみ上書きします。",
+    },
+    "dpo": {
+        "zh-Hans": "使用 `chosen / rejected` 偏好对做 DPO。`init_weight` 留空时，会自动加载当前 `save_dir` 下的 `sft_<H>_moe.pth`；手动填写路径可覆盖。",
+        "zh-Hant": "使用 `chosen / rejected` 偏好對做 DPO。`init_weight` 留空時，會自動載入目前 `save_dir` 下的 `sft_<H>_moe.pth`；手動填寫路徑可覆蓋。",
+        "en": "Run DPO on `chosen / rejected` preference pairs. Leaving `init_weight` blank auto-loads `sft_<H>_moe.pth` from the current `save_dir`; paste a path only when you want to override it.",
+        "ja": "`chosen / rejected` の選好ペアで DPO を実行します。`init_weight` を空欄にすると、現在の `save_dir` から `sft_<H>_moe.pth` を自動読み込みします。上書きしたい場合だけパスを入力してください。",
+    },
+    "orpo": {
+        "zh-Hans": "使用同样的偏好对做 ORPO。`init_weight` 留空时，会自动加载当前 `save_dir` 下的 `sft_<H>_moe.pth`；手动填写路径可覆盖。",
+        "zh-Hant": "使用相同的偏好對做 ORPO。`init_weight` 留空時，會自動載入目前 `save_dir` 下的 `sft_<H>_moe.pth`；手動填寫路徑可覆蓋。",
+        "en": "Run ORPO on the same preference-pair format. Leaving `init_weight` blank auto-loads `sft_<H>_moe.pth` from the current `save_dir`; paste a path only when you want to override it.",
+        "ja": "同じ選好ペア形式で ORPO を実行します。`init_weight` を空欄にすると、現在の `save_dir` から `sft_<H>_moe.pth` を自動読み込みします。上書きしたい場合だけパスを入力してください。",
+    },
+    "grpo": {
+        "zh-Hans": "使用 prompt 数据做 GRPO rollout。`init_weight` 留空时，会自动加载当前 `save_dir` 下的 `orpo_<H>_moe.pth`；`reward` 可配置。",
+        "zh-Hant": "使用 prompt 資料做 GRPO rollout。`init_weight` 留空時，會自動載入目前 `save_dir` 下的 `orpo_<H>_moe.pth`；`reward` 可設定。",
+        "en": "Run GRPO rollouts on prompt-style data. Leaving `init_weight` blank auto-loads `orpo_<H>_moe.pth` from the current `save_dir`; `reward` remains configurable.",
+        "ja": "prompt 形式のデータで GRPO rollout を行います。`init_weight` を空欄にすると、現在の `save_dir` から `orpo_<H>_moe.pth` を自動読み込みします。`reward` は設定できます。",
+    },
+    "distill": {
+        "zh-Hans": "蒸馏阶段中，学生 `init_weight` 留空时会自动接续当前 `save_dir` 下的 `grpo_<H>_moe.pth`；`teacher_path` 留空时会自动解析 `sft_<H>_moe.pth`。只有手动填路径时才覆盖。",
+        "zh-Hant": "蒸餾階段中，學生 `init_weight` 留空時會自動接續目前 `save_dir` 下的 `grpo_<H>_moe.pth`；`teacher_path` 留空時會自動解析 `sft_<H>_moe.pth`。只有手動填路徑時才覆蓋。",
+        "en": "For distillation, a blank student `init_weight` auto-resolves `grpo_<H>_moe.pth` from the current `save_dir`, and a blank `teacher_path` auto-resolves `sft_<H>_moe.pth`. Paste paths only when you want to override either one.",
+        "ja": "蒸留では、学生側の `init_weight` を空欄にすると現在の `save_dir` から `grpo_<H>_moe.pth` を自動解決し、`teacher_path` を空欄にすると `sft_<H>_moe.pth` を自動解決します。上書きしたい場合だけパスを入力してください。",
+    },
+}
+STAGE_METRIC_LABELS = {
+    "pretrain": ("Total Loss", "CE Loss", "Aux Loss"),
+    "sft": ("SFT Loss", "CE Loss", "Lookahead"),
+    "dpo": ("DPO Loss", "Preference", "Anchor"),
+    "orpo": ("ORPO Loss", "Chosen NLL", "OR Term"),
+    "grpo": ("GRPO Loss", "Policy", "KL"),
+    "distill": ("Distill Loss", "KD Loss", "CE Loss"),
+}
+STAGE_CHART_META = {
+    "pretrain": {
+        "title": "Pretrain Metrics",
+        "primary": "CE",
+        "secondary": "Aux",
+        "tertiary": "Temporal",
+        "val": "Validation",
+        "speed_title": "Training Speed (steps/s)",
+        "speed_label": "steps/s",
+    },
+    "sft": {
+        "title": "SFT Metrics",
+        "primary": "CE",
+        "secondary": "Lookahead",
+        "tertiary": "Anchor",
+        "val": "Validation",
+        "speed_title": "SFT Speed (steps/s)",
+        "speed_label": "steps/s",
+    },
+    "dpo": {
+        "title": "DPO Metrics",
+        "primary": "Preference",
+        "secondary": "Anchor",
+        "tertiary": "Lookahead",
+        "val": "Validation",
+        "speed_title": "Preference Speed (steps/s)",
+        "speed_label": "steps/s",
+    },
+    "orpo": {
+        "title": "ORPO Metrics",
+        "primary": "Chosen NLL",
+        "secondary": "OR Term",
+        "tertiary": "Anchor",
+        "val": "Validation",
+        "speed_title": "ORPO Speed (steps/s)",
+        "speed_label": "steps/s",
+    },
+    "grpo": {
+        "title": "GRPO Metrics",
+        "primary": "Policy",
+        "secondary": "KL",
+        "tertiary": "Reward",
+        "val": "Validation",
+        "speed_title": "Rollout Speed + Reward",
+        "speed_label": "rollouts/s",
+        "speed_overlay": "Mean Reward",
+    },
+    "distill": {
+        "title": "Distill Metrics",
+        "primary": "KD",
+        "secondary": "CE",
+        "tertiary": "Anchor",
+        "val": "Validation",
+        "speed_title": "Distill Speed (steps/s)",
+        "speed_label": "steps/s",
+    },
+}
 
 
 DEFAULT_STAGE_SAMPLE_PROMPTS = {
@@ -25,17 +165,29 @@ DEFAULT_STAGE_SAMPLE_PROMPTS = {
         "en": "User: Why is Chronos's dual-layer routing better suited to consumer hardware than reactive expert offload?\nAssistant:",
         "ja": "ユーザー: なぜ Chronos の二層ルーティングは、従来の受動的な expert offload よりも民生向けハードウェアに向いているのですか？\nアシスタント:",
     },
-    "rl": {
+    "dpo": {
+        "zh-Hans": "用户：请比较 Chronos 和传统 reactive offload 在推理时的关键差异。\n助手：",
+        "zh-Hant": "使用者：請比較 Chronos 與傳統 reactive offload 在推理時的關鍵差異。\n助手：",
+        "en": "User: Compare Chronos with conventional reactive offload during inference.\nAssistant:",
+        "ja": "ユーザー: 推論時における Chronos と従来の reactive offload の主要な違いを比較してください。\nアシスタント:",
+    },
+    "orpo": {
+        "zh-Hans": "用户：请写一段面向开发者的 Project Chronos 介绍。\n助手：",
+        "zh-Hant": "使用者：請寫一段面向開發者的 Project Chronos 介紹。\n助手：",
+        "en": "User: Write a developer-facing introduction to Project Chronos.\nAssistant:",
+        "ja": "ユーザー: 開発者向けの Project Chronos 紹介文を書いてください。\nアシスタント:",
+    },
+    "grpo": {
         "zh-Hans": "请比较 Chronos 与传统 MoE offload 在吞吐、首 token 延迟和缓存未命中行为上的权衡。",
         "zh-Hant": "請比較 Chronos 與傳統 MoE offload 在吞吐、首 token 延遲和快取未命中行為上的權衡。",
         "en": "Compare Chronos with conventional MoE offload in terms of throughput, first-token latency, and cache-miss behavior.",
         "ja": "Chronos と従来の MoE offload を、スループット、初回トークン遅延、キャッシュミス時の挙動で比較してください。",
     },
-    "orpo": {
-        "zh-Hans": "请写一段更适合 README 首页的英文介绍，突出 Predictive Prefill、Soft Gating 和 6-stage training pipeline。",
-        "zh-Hant": "請寫一段更適合 README 首頁的英文介紹，突出 Predictive Prefill、Soft Gating 和 6-stage training pipeline。",
-        "en": "Write a README-ready intro that highlights predictive prefill, soft gating, and the 6-stage training pipeline.",
-        "ja": "predictive prefill、soft gating、6-stage training pipeline を強調した README 向けの紹介文を書いてください。",
+    "distill": {
+        "zh-Hans": "请用更现代、更有产品感的英文改写 Project Chronos 的首页介绍，保留核心技术点。",
+        "zh-Hant": "請用更現代、更有產品感的英文改寫 Project Chronos 的首頁介紹，保留核心技術點。",
+        "en": "Rewrite the Project Chronos landing-page intro in a more modern product voice while preserving the core technical claims.",
+        "ja": "Project Chronos のトップ紹介文を、技術的な要点を保ったまま、よりモダンでプロダクト寄りの英語に書き換えてください。",
     },
 }
 
@@ -54,6 +206,142 @@ def _default_sample_prompts() -> set[str]:
 
 
 DEFAULT_SAMPLE_PROMPT_VALUES = _default_sample_prompts()
+DEFAULT_STAGE_DATA_VALUES = {v.strip() for v in STAGE_DEFAULT_DATA.values() if v.strip()}
+DEFAULT_STAGE_INIT_VALUES = {
+    f"./out/{prefix}_768_moe.pth"
+    for prefix in STAGE_DEFAULT_INIT.values()
+}
+
+PRETRAIN_INIT_PLACEHOLDER = {
+    "zh-Hans": "留空则按当前 save_dir 自动续训同阶段 checkpoint",
+    "zh-Hant": "留空則按目前 save_dir 自動續訓同階段 checkpoint",
+    "en": "Leave blank to auto-resume the current-stage checkpoint from save_dir",
+    "ja": "空欄なら save_dir から同一ステージ checkpoint を自動再開",
+}
+UPSTREAM_INIT_PLACEHOLDER = {
+    "zh-Hans": "留空则按当前 save_dir 自动载入 {prefix}_<H>_moe.pth，手动填写才覆盖",
+    "zh-Hant": "留空則按目前 save_dir 自動載入 {prefix}_<H>_moe.pth，手動填寫才覆蓋",
+    "en": "Leave blank to auto-load {prefix}_<H>_moe.pth from save_dir; paste a path to override",
+    "ja": "空欄なら save_dir から {prefix}_<H>_moe.pth を自動読み込み。上書き時だけパスを指定",
+}
+DISTILL_TEACHER_PLACEHOLDER = {
+    "zh-Hans": "留空则按当前 save_dir 自动载入 sft_<H>_moe.pth，手动填写才覆盖",
+    "zh-Hant": "留空則按目前 save_dir 自動載入 sft_<H>_moe.pth，手動填寫才覆蓋",
+    "en": "Leave blank to auto-load sft_<H>_moe.pth from save_dir; paste a path to override",
+    "ja": "空欄なら save_dir から sft_<H>_moe.pth を自動読み込み。上書き時だけパスを指定",
+}
+
+TRAIN_BACKEND_CHOICES = ["auto", "cuda", "xpu", "mps", "cpu"]
+
+TRAIN_BACKEND_LABELS = {
+    "auto": {
+        "zh-Hans": "自动 (默认最快)",
+        "zh-Hant": "自動 (預設最快)",
+        "en": "Auto (fastest default)",
+        "ja": "自動 (最速を既定)",
+    },
+    "cuda": {
+        "zh-Hans": "CUDA",
+        "zh-Hant": "CUDA",
+        "en": "CUDA",
+        "ja": "CUDA",
+    },
+    "mps": {
+        "zh-Hans": "MPS",
+        "zh-Hant": "MPS",
+        "en": "MPS",
+        "ja": "MPS",
+    },
+    "xpu": {
+        "zh-Hans": "XPU",
+        "zh-Hant": "XPU",
+        "en": "XPU",
+        "ja": "XPU",
+    },
+    "cpu": {
+        "zh-Hans": "CPU",
+        "zh-Hant": "CPU",
+        "en": "CPU",
+        "ja": "CPU",
+    },
+}
+
+
+def _stage_text(stage_map: dict[str, str], mode: str, lang: str | None = None) -> str:
+    lang = lang or get_current_lang()
+    per_stage = stage_map.get(mode, stage_map["pretrain"])
+    return per_stage.get(lang, per_stage["en"])
+
+
+def _stage_init_placeholder(mode: str, lang: str | None = None) -> str:
+    lang = lang or get_current_lang()
+    if mode == "pretrain":
+        return PRETRAIN_INIT_PLACEHOLDER.get(lang, PRETRAIN_INIT_PLACEHOLDER["en"])
+    upstream = STAGE_DEFAULT_INIT.get(mode, "chronos")
+    template = UPSTREAM_INIT_PLACEHOLDER.get(lang, UPSTREAM_INIT_PLACEHOLDER["en"])
+    return template.format(prefix=upstream)
+
+
+def _normalize_stage_init_value(current_init_weight: str | None) -> str:
+    current_init = (current_init_weight or "").strip()
+    if current_init in DEFAULT_STAGE_INIT_VALUES:
+        return ""
+    return current_init
+
+
+def _distill_teacher_placeholder(lang: str | None = None) -> str:
+    lang = lang or get_current_lang()
+    return DISTILL_TEACHER_PLACEHOLDER.get(lang, DISTILL_TEACHER_PLACEHOLDER["en"])
+
+
+def _available_train_backend_choices() -> list[str]:
+    available = set(training_available())
+    return ["auto"] + [name for name in TRAIN_BACKEND_CHOICES[1:] if name in available]
+
+
+def _train_backend_label(name: str, lang: str | None = None) -> str:
+    lang = lang or get_current_lang()
+    labels = TRAIN_BACKEND_LABELS.get(name, TRAIN_BACKEND_LABELS["auto"])
+    return labels.get(lang, labels["en"])
+
+
+def _train_backend_dropdown_choices(lang: str | None = None) -> list[tuple[str, str]]:
+    return [
+        (_train_backend_label(name, lang), name)
+        for name in _available_train_backend_choices()
+    ]
+
+
+def _default_train_backend_value() -> str:
+    return "auto"
+
+
+def _normalize_dtype_for_trainer(dtype: str | None) -> str:
+    dt = (dtype or "fp16").strip().lower()
+    if dt in {"bf16", "bfloat16"}:
+        return "bfloat16"
+    return "float16"
+
+
+@contextmanager
+def _trainer_logger_sink(put_line):
+    from trainer import trainer_utils as _tu  # type: ignore
+
+    orig_logger = _tu.Logger
+
+    def _hook(content):
+        line = str(content)
+        put_line(line)
+        try:
+            orig_logger(content)
+        except Exception:
+            pass
+
+    _tu.Logger = _hook
+    try:
+        yield
+    finally:
+        _tu.Logger = orig_logger
 
 
 def _sniff_checkpoint(path: str) -> dict:
@@ -179,16 +467,169 @@ class TrainSession:
         with self._metric_lock:
             return list(self._metrics)
 
+    def _stage_checkpoint_path(self, save_dir: str, mode: str, hidden_size: int) -> str:
+        prefix = STAGE_CHECKPOINT_PREFIX.get(mode, "chronos")
+        return os.path.join(save_dir, f"{prefix}_{hidden_size}_moe.pth")
+
+    def _default_init_path(self, save_dir: str, mode: str, hidden_size: int) -> str:
+        upstream = STAGE_DEFAULT_INIT.get(mode)
+        if not upstream:
+            return ""
+        return os.path.join(save_dir, f"{upstream}_{hidden_size}_moe.pth")
+
+    def _topology_mismatches(self, sniffed: dict, model_cfg_kwargs: dict) -> list[str]:
+        mismatches = []
+        for k in [
+            "hidden_size", "num_hidden_layers", "num_experts",
+            "moe_intermediate_size", "vocab_size", "lookahead_steps",
+        ]:
+            if k in sniffed and k in model_cfg_kwargs and int(sniffed[k]) != int(model_cfg_kwargs[k]):
+                mismatches.append(f"{k}: ckpt={sniffed[k]} != ui={model_cfg_kwargs[k]}")
+        return mismatches
+
+    def _build_stage_args(self, cfg: dict, mode: str, save_dir: str, hidden_size: int):
+        reward_spec = (cfg.get("reward_spec") or "toy").strip() or "toy"
+        teacher_path = (cfg.get("teacher_path") or "").strip()
+        return SimpleNamespace(
+            device=cfg.get("device", "cpu"),
+            dtype=_normalize_dtype_for_trainer(cfg.get("dtype")),
+            learning_rate=float(cfg.get("learning_rate", 5e-4)),
+            accumulation_steps=max(1, int(cfg.get("accumulation_steps", 1))),
+            grad_clip=float(cfg.get("grad_clip", 1.0)),
+            log_interval=max(1, int(cfg.get("log_interval", 10))),
+            save_interval=max(1, int(cfg.get("save_interval", 500))),
+            save_dir=save_dir,
+            epochs=max(1, int(cfg.get("epochs", 1))),
+            batch_size=max(1, int(cfg.get("batch_size", 1))),
+            max_seq_len=max(8, int(cfg.get("max_seq_len", 512))),
+            max_gen_len=max(1, int(cfg.get("max_gen_len", 24))),
+            num_generations=max(1, int(cfg.get("num_generations", 4))),
+            temperature=float(cfg.get("temperature", 1.0)),
+            beta=float(cfg.get("beta", 0.1)),
+            alpha=float(cfg.get("alpha", 0.7)),
+            lambda_or=float(cfg.get("lambda_or", 0.1)),
+            lambda_router_anchor=float(cfg.get("lambda_router_anchor", 0.0)),
+            reward=reward_spec,
+            teacher_path=teacher_path or os.path.join(save_dir, f"sft_{hidden_size}_moe.pth"),
+            hidden_size=hidden_size,
+            num_hidden_layers=int(cfg.get("num_hidden_layers", 8)),
+            num_experts=int(cfg.get("num_experts", 4)),
+            steps=int(cfg.get("max_steps", 0)) or None,
+            weight_decay=float(cfg.get("weight_decay", 0.01)),
+        )
+
+    def _record_stage_metric(self, mode: str, step: int, result, tps: float = 0.0):
+        meta = STAGE_CHART_META.get(mode, STAGE_CHART_META["pretrain"])
+        if isinstance(result, tuple):
+            if mode == "sft":
+                total, ce_loss, aux_loss, lookahead, anchor = result
+                metric = {
+                    "total": total,
+                    "primary": ce_loss,
+                    "secondary": lookahead,
+                    "tertiary": anchor,
+                    "ce": ce_loss,
+                    "aux": lookahead,
+                    "temporal": anchor,
+                }
+            elif mode == "dpo":
+                total, pref_loss, _aux_loss, lookahead, anchor = result
+                metric = {
+                    "total": total,
+                    "primary": pref_loss,
+                    "secondary": anchor,
+                    "tertiary": lookahead,
+                    "ce": pref_loss,
+                    "aux": anchor,
+                    "temporal": lookahead,
+                }
+            elif mode == "orpo":
+                total, chosen_nll, or_term, _lookahead, anchor = result
+                metric = {
+                    "total": total,
+                    "primary": chosen_nll,
+                    "secondary": or_term,
+                    "tertiary": anchor,
+                    "ce": chosen_nll,
+                    "aux": or_term,
+                    "temporal": anchor,
+                }
+            elif mode == "distill":
+                total, kd_loss, ce_loss, _lookahead, anchor = result
+                metric = {
+                    "total": total,
+                    "primary": kd_loss,
+                    "secondary": ce_loss,
+                    "tertiary": anchor,
+                    "ce": kd_loss,
+                    "aux": ce_loss,
+                    "temporal": anchor,
+                }
+            else:
+                return
+        elif isinstance(result, dict) and mode == "grpo":
+            metric = {
+                "total": result.get("loss", 0.0),
+                "primary": result.get("pg_loss", 0.0),
+                "secondary": result.get("kl", 0.0),
+                "tertiary": result.get("mean_reward", 0.0),
+                "ce": result.get("pg_loss", 0.0),
+                "aux": result.get("kl", 0.0),
+                "temporal": result.get("mean_reward", 0.0),
+            }
+        else:
+            return
+
+        if mode == "pretrain":
+            metric.setdefault("primary", metric.get("ce", 0.0))
+            metric.setdefault("secondary", metric.get("aux", 0.0))
+            metric.setdefault("tertiary", metric.get("temporal", 0.0))
+
+        metric.update({"step": int(step), "tps": float(tps)})
+        self.step = int(step)
+        self.loss = float(metric["total"])
+        self._put_metric(metric)
+        self._put(
+            f"[{mode.upper()} summary] step={step} total={metric['total']:.4f} "
+            f"{meta['primary']}={metric.get('primary', 0.0):.4f} "
+            f"{meta['secondary']}={metric.get('secondary', 0.0):.4f} "
+            f"{meta['tertiary']}={metric.get('tertiary', 0.0):.4f} "
+            f"tps={tps:.2f}"
+        )
+
+    def _generate_live_sample(self, model, device: str, cfg: dict, mode: str):
+        import torch
+
+        sp = (cfg.get("sample_prompt") or "").strip()
+        if not sp:
+            sp = _stage_sample_prompt(mode)
+        tokenizer = self._load_tokenizer()
+        ids = tokenizer.encode(sp, return_tensors="pt").to(device)
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            gen = ids.clone()
+            for _ in range(80):
+                o, _ = model(gen, use_cache=False)
+                nxt = o.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                gen = torch.cat([gen, nxt], dim=-1)
+                if int(nxt.item()) == (tokenizer.eos_token_id or -1):
+                    break
+        txt = tokenizer.decode(gen[0].tolist(), skip_special_tokens=True)
+        if was_training:
+            model.train()
+        self.last_sample = txt
+        self.last_sample_step = self.step or self.last_sample_step
+        self._put(f"[sample @ step {self.last_sample_step or 0}] {txt[:200]}")
+
     def _run(self, cfg: dict, mode: str):
         t_start = time.monotonic()
         try:
             import torch
-            import torch.optim as optim
             from torch.utils.data import DataLoader
 
             from chronos.model.config import ChronosConfig
             from chronos.model.model_chronos import ChronosForCausalLM
-            from chronos.model.temporal_loss import total_loss
             from chronos.model.moe_chronos import ChronosMOEFeedForward
 
             self._put(f"[{mode.upper()}] Building model...")
@@ -249,32 +690,18 @@ class TrainSession:
                       f"vocab={model_cfg.vocab_size})")
 
             save_dir = cfg.get("save_dir", "./out")
-            # Output checkpoint path differs per stage so SFT doesn't
-            # clobber the pretrain weights, DPO doesn't clobber SFT, etc.
-            STAGE_PREFIX = {
-                "pretrain": "chronos", "sft": "sft",
-                "rl": "rl", "orpo": "orpo",
-            }
-            out_prefix = STAGE_PREFIX.get(mode, "chronos")
-            ckp_path = os.path.join(save_dir, f"{out_prefix}_{model_cfg.hidden_size}_moe.pth")
+            ckp_path = self._stage_checkpoint_path(save_dir, mode, model_cfg.hidden_size)
 
             # Init-weight resolution:
             #   - pretrain: optionally resume from its own checkpoint if present
-            #   - sft/rl/orpo: REQUIRE an upstream weight (init_weight from UI,
-            #     or fall back to the previous-stage default in save_dir).
+            #   - other stages: require an upstream weight (explicit init_weight
+            #     or the stage's default predecessor checkpoint).
             init_weight = (cfg.get("init_weight") or "").strip()
             if mode == "pretrain":
                 resume_path = init_weight or ckp_path
                 if os.path.exists(resume_path):
                     sniffed = _sniff_checkpoint(resume_path)
-                    mismatches = []
-                    for k in [
-                        "hidden_size", "num_hidden_layers", "num_experts",
-                        "moe_intermediate_size", "vocab_size", "lookahead_steps",
-                    ]:
-                        if k in sniffed and k in model_cfg_kwargs and int(sniffed[k]) != int(model_cfg_kwargs[k]):
-                            mismatches.append(f"{k}: ckpt={sniffed[k]} != ui={model_cfg_kwargs[k]}")
-
+                    mismatches = self._topology_mismatches(sniffed, model_cfg_kwargs)
                     if mismatches:
                         self._put(
                             "Resume checkpoint exists but does not match current UI config; "
@@ -287,28 +714,17 @@ class TrainSession:
                 else:
                     self._put("Pretraining from random init")
             else:
-                STAGE_DEFAULT_INIT = {
-                    "sft":  f"chronos_{model_cfg.hidden_size}_moe.pth",
-                    "rl":   f"sft_{model_cfg.hidden_size}_moe.pth",
-                    "orpo": f"sft_{model_cfg.hidden_size}_moe.pth",
-                }
-                load_path = init_weight or os.path.join(save_dir, STAGE_DEFAULT_INIT[mode])
+                load_path = init_weight or self._default_init_path(save_dir, mode, model_cfg.hidden_size)
                 if not os.path.exists(load_path):
                     raise FileNotFoundError(
                         f"[{mode.upper()}] requires an upstream checkpoint to initialize from. "
                         f"Tried: {load_path}\n"
                         f"Set 'init_weight' in the Train tab to point at a valid .pth, "
-                        f"or run the prior stage first (Pretrain → SFT → DPO/ORPO/GRPO)."
+                        f"or run the prior stage first."
                     )
 
                 sniffed = _sniff_checkpoint(load_path)
-                mismatch_hints = []
-                for k in [
-                    "hidden_size", "num_hidden_layers", "num_experts",
-                    "moe_intermediate_size", "vocab_size", "lookahead_steps",
-                ]:
-                    if k in sniffed and k in model_cfg_kwargs and int(sniffed[k]) != int(model_cfg_kwargs[k]):
-                        mismatch_hints.append(f"{k}: ckpt={sniffed[k]} != ui={model_cfg_kwargs[k]}")
+                mismatch_hints = self._topology_mismatches(sniffed, model_cfg_kwargs)
                 if mismatch_hints:
                     raise RuntimeError(
                         f"[{mode.upper()}] init checkpoint topology does not match current UI config:\n  "
@@ -320,15 +736,14 @@ class TrainSession:
                 model.load_state_dict(weights, strict=False)
                 self._put(f"[{mode.upper()}] Initialized from {load_path}")
 
-            device = "cuda" if torch.cuda.is_available() else (
-                "mps" if torch.backends.mps.is_available() else "cpu"
-            )
+            requested_backend = (cfg.get("train_backend") or "auto").strip().lower() or "auto"
+            resolved_backend, device = resolve_training_device(requested_backend)
+            cfg["train_backend"] = requested_backend
+            cfg["device"] = device
+            self._put(f"Training backend: {resolved_backend} (requested: {requested_backend})")
             self._put(f"Device: {device}")
             model = model.to(device)
             from chronos.trainer.optim_utils import build_optimizer, get_lr, apply_lr
-            base_lr = float(cfg.get("learning_rate", 5e-4))
-            weight_decay = float(cfg.get("weight_decay", 0.01))
-            optimizer = build_optimizer(model, lr=base_lr, weight_decay=weight_decay)
 
             data_path = cfg.get("data_path", "")
             max_seq_len = cfg.get("max_seq_len", 512)
@@ -339,6 +754,9 @@ class TrainSession:
             log_interval = max(1, cfg.get("log_interval", 10))
             val_ratio = float(cfg.get("val_ratio", 0.05))
             max_steps = int(cfg.get("max_steps", 0)) or None  # 0 => no cap
+            base_lr = float(cfg.get("learning_rate", 5e-4))
+            weight_decay = float(cfg.get("weight_decay", 0.01))
+            optimizer = build_optimizer(model, lr=base_lr, weight_decay=weight_decay)
 
             if not data_path or not os.path.exists(data_path):
                 self._put("No dataset found — running synthetic smoke test (50 steps)")
@@ -346,20 +764,20 @@ class TrainSession:
                 val_loader = None
             else:
                 tokenizer = self._load_tokenizer()
-                # Streaming JSONL — O(N · 8B) RSS regardless of corpus size.
-                # Avoids the HuggingFace `load_dataset('json', ...)` Arrow
-                # mmap path which kept blowing up to 100s of GB resident
-                # under continuous random access on macOS.
                 from chronos.data.flexible_dataset import (
-                    FlexibleDataset, StreamingSFTDataset,
+                    FlexibleDataset, StreamingSFTDataset, StreamingDPODataset,
                 )
                 if mode == "pretrain":
                     full_ds = FlexibleDataset(data_path, tokenizer, max_length=max_seq_len)
-                else:
+                elif mode in {"sft", "distill"}:
                     full_ds = StreamingSFTDataset(data_path, tokenizer, max_length=max_seq_len)
+                elif mode in {"dpo", "orpo"}:
+                    full_ds = StreamingDPODataset(data_path, tokenizer, max_length=max_seq_len)
+                else:
+                    full_ds = None
                 # Deterministic val split: every 1/val_ratio-th record goes to val
                 # (idx-modulo split → reproducible without rescanning the file).
-                if val_ratio > 0 and len(full_ds) >= 20:
+                if full_ds is not None and val_ratio > 0 and len(full_ds) >= 20:
                     stride = max(2, int(round(1.0 / val_ratio)))
                     val_idx   = [i for i in range(len(full_ds)) if i % stride == 0]
                     train_idx = [i for i in range(len(full_ds)) if i % stride != 0]
@@ -367,15 +785,30 @@ class TrainSession:
                     train_ds = Subset(full_ds, train_idx)
                     val_ds   = Subset(full_ds, val_idx)
                     self._put(f"Split: train={len(train_ds)}  val={len(val_ds)}")
-                else:
+                elif full_ds is not None:
                     train_ds, val_ds = full_ds, None
-                loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                    num_workers=0, pin_memory=False)
+                else:
+                    train_ds, val_ds = None, None
+                loader = (
+                    DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False)
+                    if train_ds is not None else None
+                )
                 val_loader = (
                     DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                                num_workers=0, pin_memory=False)
                     if val_ds is not None else None
                 )
+
+            if mode in {"grpo"}:
+                tokenizer = self._load_tokenizer()
+                from chronos.trainer.grpo_trainer import load_grpo_prompts
+                prompts = load_grpo_prompts(data_path, max_prompts=max_steps)
+                if not prompts:
+                    raise ValueError(f"[{mode.upper()}] no prompts found in {data_path}")
+                planned = max(1, len(prompts) * epochs)
+                self.total_steps = min(planned, max_steps) if (max_steps and planned) else planned
+            else:
+                prompts = None
 
             model.train()
             global_step = 0
@@ -384,10 +817,17 @@ class TrainSession:
             best_path = ckp_path.replace(".pth", ".best.pth")
             # Steps remaining for ETA / progress bar — respect max_steps cap.
             try:
-                planned = max(1, len(loader) * epochs)
+                planned = max(1, len(loader) * epochs) if loader is not None else 0
             except Exception:
                 planned = 0
-            self.total_steps = min(planned, max_steps) if (max_steps and planned) else (planned or (max_steps or 0))
+            if mode != "grpo":
+                self.total_steps = min(planned, max_steps) if (max_steps and planned) else (planned or (max_steps or 0))
+
+            stage_args = self._build_stage_args(cfg, mode, save_dir, model_cfg.hidden_size)
+            stage_args.device = device
+
+            if mode in {"sft", "dpo", "orpo", "grpo", "distill"}:
+                tokenizer = self._load_tokenizer()
 
             def _eval_val() -> float:
                 if val_loader is None:
@@ -403,6 +843,163 @@ class TrainSession:
                         tot += float(vout.loss.item()); n += 1
                 model.train()
                 return tot / max(n, 1)
+
+            if mode in {"sft", "dpo", "orpo", "grpo", "distill"}:
+                with _trainer_logger_sink(self._put):
+                    if mode == "sft":
+                        from chronos.trainer.sft_trainer import ChronosSFTTrainer
+
+                        trainer = ChronosSFTTrainer(model, model_cfg, stage_args, tokenizer)
+                        if float(getattr(model_cfg, "lambda_router_anchor", 0.0)) > 0 and loader is not None:
+                            first_batch = next(iter(loader))
+                            trainer.set_calibration_batch(first_batch[0])
+                            self._put("[SFT] Router anchor reference captured.")
+                        iters = len(loader) if stage_args.steps is None else min(stage_args.steps, len(loader))
+                        self.total_steps = max(1, stage_args.epochs * iters)
+                        for epoch in range(stage_args.epochs):
+                            epoch_start = time.monotonic()
+                            for step_idx, (ids, labels) in enumerate(loader, start=1):
+                                if self._stop.is_set():
+                                    break
+                                if stage_args.steps is not None and step_idx > stage_args.steps:
+                                    break
+                                result = trainer.train_step(ids, labels, epoch * iters + step_idx, self.total_steps)
+                                if step_idx % stage_args.log_interval == 0 or step_idx == iters:
+                                    elapsed = max(time.monotonic() - epoch_start, 1e-6)
+                                    self._record_stage_metric(mode, epoch * iters + step_idx, result, tps=step_idx / elapsed)
+                                if step_idx % stage_args.save_interval == 0:
+                                    trainer._save(epoch, step_idx)
+                                    self._generate_live_sample(model, device, cfg, mode)
+                            if self._stop.is_set() or stage_args.steps is not None:
+                                break
+                        trainer._save(epoch=stage_args.epochs - 1, step=iters)
+                    elif mode == "dpo":
+                        from chronos.trainer.dpo_trainer import ChronosDPOTrainer
+
+                        trainer = ChronosDPOTrainer(model, model_cfg, stage_args, tokenizer)
+                        if float(getattr(model_cfg, "lambda_router_anchor", 0.0)) > 0 and loader is not None:
+                            first = next(iter(loader))
+                            calib = torch.cat([first["x_chosen"], first["x_rejected"]], dim=0)
+                            trainer.set_calibration_batch(calib)
+                            self._put("[DPO] Router anchor reference captured.")
+                        iters = len(loader) if stage_args.steps is None else min(stage_args.steps, len(loader))
+                        self.total_steps = max(1, stage_args.epochs * iters)
+                        for epoch in range(stage_args.epochs):
+                            epoch_start = time.monotonic()
+                            for step_idx, batch in enumerate(loader, start=1):
+                                if self._stop.is_set():
+                                    break
+                                if stage_args.steps is not None and step_idx > stage_args.steps:
+                                    break
+                                result = trainer.train_step(batch, epoch * iters + step_idx, self.total_steps)
+                                if step_idx % stage_args.log_interval == 0 or step_idx == iters:
+                                    elapsed = max(time.monotonic() - epoch_start, 1e-6)
+                                    self._record_stage_metric(mode, epoch * iters + step_idx, result, tps=step_idx / elapsed)
+                                if step_idx % stage_args.save_interval == 0:
+                                    trainer._save(epoch, step_idx)
+                                    self._generate_live_sample(model, device, cfg, mode)
+                            if self._stop.is_set() or stage_args.steps is not None:
+                                break
+                        trainer._save(epoch=stage_args.epochs - 1, step=iters)
+                    elif mode == "orpo":
+                        from chronos.trainer.orpo_trainer import ChronosORPOTrainer
+
+                        trainer = ChronosORPOTrainer(model, model_cfg, stage_args, tokenizer)
+                        if float(getattr(model_cfg, "lambda_router_anchor", 0.0)) > 0 and loader is not None:
+                            first = next(iter(loader))
+                            calib = torch.cat([first["x_chosen"], first["x_rejected"]], dim=0)
+                            trainer.set_calibration_batch(calib)
+                            self._put("[ORPO] Router anchor reference captured.")
+                        iters = len(loader) if stage_args.steps is None else min(stage_args.steps, len(loader))
+                        self.total_steps = max(1, stage_args.epochs * iters)
+                        for epoch in range(stage_args.epochs):
+                            epoch_start = time.monotonic()
+                            for step_idx, batch in enumerate(loader, start=1):
+                                if self._stop.is_set():
+                                    break
+                                if stage_args.steps is not None and step_idx > stage_args.steps:
+                                    break
+                                result = trainer.train_step(batch, epoch * iters + step_idx, self.total_steps)
+                                if step_idx % stage_args.log_interval == 0 or step_idx == iters:
+                                    elapsed = max(time.monotonic() - epoch_start, 1e-6)
+                                    self._record_stage_metric(mode, epoch * iters + step_idx, result, tps=step_idx / elapsed)
+                                if step_idx % stage_args.save_interval == 0:
+                                    trainer._save(epoch, step_idx)
+                                    self._generate_live_sample(model, device, cfg, mode)
+                            if self._stop.is_set() or stage_args.steps is not None:
+                                break
+                        trainer._save(epoch=stage_args.epochs - 1, step=iters)
+                    elif mode == "grpo":
+                        from chronos.trainer.grpo_trainer import ChronosGRPOTrainer
+                        from chronos.trainer.reward import build_reward_fn
+
+                        reward_fn = build_reward_fn(stage_args.reward)
+                        trainer = ChronosGRPOTrainer(model, model_cfg, stage_args, tokenizer, reward_fn=reward_fn)
+                        if float(getattr(model_cfg, "lambda_router_anchor", 0.0)) > 0 and prompts:
+                            calib = tokenizer(
+                                prompts[0], return_tensors="pt", truncation=True, max_length=stage_args.max_seq_len
+                            ).input_ids
+                            trainer.set_calibration_batch(calib)
+                            self._put("[GRPO] Router anchor reference captured.")
+                        iters = len(prompts) if stage_args.steps is None else min(stage_args.steps, len(prompts))
+                        self.total_steps = max(1, stage_args.epochs * iters)
+                        for epoch in range(stage_args.epochs):
+                            epoch_start = time.monotonic()
+                            for step_idx, prompt in enumerate(prompts, start=1):
+                                if self._stop.is_set():
+                                    break
+                                if step_idx > iters:
+                                    break
+                                result = trainer.train_step(prompt, epoch * iters + step_idx, self.total_steps)
+                                if step_idx % stage_args.log_interval == 0 or step_idx == iters:
+                                    elapsed = max(time.monotonic() - epoch_start, 1e-6)
+                                    self._record_stage_metric(mode, epoch * iters + step_idx, result, tps=step_idx / elapsed)
+                                if step_idx % stage_args.save_interval == 0:
+                                    trainer._save(epoch, step_idx)
+                                    self._generate_live_sample(model, device, cfg, mode)
+                            if self._stop.is_set() or stage_args.steps is not None:
+                                break
+                        trainer._save(epoch=stage_args.epochs - 1, step=iters)
+                    elif mode == "distill":
+                        from chronos.trainer.distill_trainer import ChronosDistillTrainer
+
+                        teacher_path = stage_args.teacher_path
+                        if not os.path.exists(teacher_path):
+                            raise FileNotFoundError(f"[DISTILL] teacher not found: {teacher_path}")
+                        teacher = ChronosForCausalLM(model_cfg).to(device)
+                        t_state = torch.load(teacher_path, map_location=device)
+                        teacher.load_state_dict(t_state, strict=False)
+                        teacher.eval().requires_grad_(False)
+                        self._put(f"[DISTILL] Teacher: {teacher_path}")
+                        trainer = ChronosDistillTrainer(model, teacher, model_cfg, stage_args, tokenizer)
+                        if float(getattr(model_cfg, "lambda_router_anchor", 0.0)) > 0 and loader is not None:
+                            first = next(iter(loader))
+                            trainer.set_calibration_batch(first[0])
+                            self._put("[DISTILL] Router anchor reference captured.")
+                        iters = len(loader) if stage_args.steps is None else min(stage_args.steps, len(loader))
+                        self.total_steps = max(1, stage_args.epochs * iters)
+                        for epoch in range(stage_args.epochs):
+                            epoch_start = time.monotonic()
+                            for step_idx, (ids, labels) in enumerate(loader, start=1):
+                                if self._stop.is_set():
+                                    break
+                                if stage_args.steps is not None and step_idx > stage_args.steps:
+                                    break
+                                result = trainer.train_step(ids, labels, epoch * iters + step_idx, self.total_steps)
+                                if step_idx % stage_args.log_interval == 0 or step_idx == iters:
+                                    elapsed = max(time.monotonic() - epoch_start, 1e-6)
+                                    self._record_stage_metric(mode, epoch * iters + step_idx, result, tps=step_idx / elapsed)
+                                if step_idx % stage_args.save_interval == 0:
+                                    trainer._save(epoch, step_idx)
+                                    self._generate_live_sample(model, device, cfg, mode)
+                            if self._stop.is_set() or stage_args.steps is not None:
+                                break
+                        trainer._save(epoch=stage_args.epochs - 1, step=iters)
+                self._generate_live_sample(model, device, cfg, mode)
+                elapsed = time.monotonic() - t_start
+                self._put(f"[{mode.upper()}] Training complete in {elapsed:.1f}s. Saved → {ckp_path}")
+                self.status = "finished"
+                return
 
             stop_outer = False
             for epoch in range(epochs):
@@ -579,12 +1176,13 @@ def _fmt_eta(seconds: float) -> str:
     return f"{seconds/3600:.1f}h"
 
 
-def _make_loss_chart(metrics: list[dict], total_steps: int = 0, t_start: float = 0.0):
+def _make_loss_chart(metrics: list[dict], mode: str = "pretrain", total_steps: int = 0, t_start: float = 0.0):
     """Build matplotlib figure: loss curves + throughput + progress/ETA."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        meta = STAGE_CHART_META.get(mode, STAGE_CHART_META["pretrain"])
 
         # Close any prior figures held by this thread to avoid the
         # "More than 20 figures opened" warning Gradio's Plot component triggers.
@@ -621,32 +1219,78 @@ def _make_loss_chart(metrics: list[dict], total_steps: int = 0, t_start: float =
         ax.set_facecolor("#16213e")
         if train_metrics:
             ax.plot(train_steps, [m["total"] for m in train_metrics],    color="#e94560", lw=1.5, label="train total")
-            ax.plot(train_steps, [m["ce"] for m in train_metrics],       color="#0f3460", lw=1.2, label="train ce")
-            ax.plot(train_steps, [m["aux"] for m in train_metrics],      color="#533483", lw=1.0, label="aux")
-            ax.plot(train_steps, [m["temporal"] for m in train_metrics], color="#e2b714", lw=0.9, label="temporal", ls="--")
+            ax.plot(train_steps, [m.get("primary", m.get("ce", 0.0)) for m in train_metrics],
+                    color="#0f3460", lw=1.2, label=meta["primary"])
+            ax.plot(train_steps, [m.get("secondary", m.get("aux", 0.0)) for m in train_metrics],
+                    color="#533483", lw=1.0, label=meta["secondary"])
+            ax.plot(train_steps, [m.get("tertiary", m.get("temporal", 0.0)) for m in train_metrics],
+                    color="#e2b714", lw=0.9, label=meta["tertiary"], ls="--")
         if val_metrics:
-            ax.plot(val_steps, [m["ce"] for m in val_metrics], color="#39d98a",
-                    lw=2.0, marker="o", markersize=4, label="val ce")
-        ax.set_title("Loss Curves", color="white", fontsize=11)
+            ax.plot(val_steps, [m.get("primary", m.get("ce", 0.0)) for m in val_metrics], color="#39d98a",
+                    lw=2.0, marker="o", markersize=4, label=meta["val"])
+        ax.set_title(meta["title"], color="white", fontsize=11)
         ax.set_xlabel("Step", color="#aaa")
         ax.tick_params(colors="#aaa")
         for spine in ax.spines.values():
             spine.set_edgecolor("#333")
         ax.legend(fontsize=8, facecolor="#16213e", labelcolor="white")
 
-        # ── Middle: throughput (only train rows have tps)
+        # ── Middle: stage-aware speed panel
         ax2 = axes[1]
         ax2.set_facecolor("#16213e")
         tps_steps = [m["step"] for m in train_metrics if m.get("tps", 0) > 0]
         tps_vals  = [m["tps"]  for m in train_metrics if m.get("tps", 0) > 0]
-        if tps_steps:
-            ax2.plot(tps_steps, tps_vals, color="#00b4d8", lw=1.5)
+        overlay_ax = None
+        if mode == "grpo":
+            reward_steps = [m["step"] for m in train_metrics if "tertiary" in m]
+            reward_vals = [m.get("tertiary", 0.0) for m in train_metrics if "tertiary" in m]
+            if tps_steps:
+                ax2.plot(
+                    tps_steps,
+                    tps_vals,
+                    color="#00b4d8",
+                    lw=1.6,
+                    label=meta.get("speed_label", "steps/s"),
+                )
+                ax2.fill_between(tps_steps, tps_vals, alpha=0.18, color="#00b4d8")
+            if reward_steps:
+                overlay_ax = ax2.twinx()
+                overlay_ax.set_facecolor("none")
+                overlay_ax.plot(
+                    reward_steps,
+                    reward_vals,
+                    color="#e2b714",
+                    lw=1.3,
+                    ls="--",
+                    label=meta.get("speed_overlay", meta["tertiary"]),
+                )
+                overlay_ax.tick_params(colors="#f1d36b")
+                overlay_ax.set_ylabel(meta.get("speed_overlay", meta["tertiary"]), color="#f1d36b", fontsize=9)
+                for spine in overlay_ax.spines.values():
+                    spine.set_edgecolor("#333")
+        elif tps_steps:
+            ax2.plot(
+                tps_steps,
+                tps_vals,
+                color="#00b4d8",
+                lw=1.5,
+                label=meta.get("speed_label", "steps/s"),
+            )
             ax2.fill_between(tps_steps, tps_vals, alpha=0.2, color="#00b4d8")
-        ax2.set_title("Throughput (steps/s)", color="white", fontsize=11)
+        ax2.set_title(meta.get("speed_title", "Training Speed (steps/s)"), color="white", fontsize=11)
         ax2.set_xlabel("Step", color="#aaa")
+        ax2.set_ylabel(meta.get("speed_label", "steps/s"), color="#8ae9ff", fontsize=9)
         ax2.tick_params(colors="#aaa")
         for spine in ax2.spines.values():
             spine.set_edgecolor("#333")
+        if tps_steps or overlay_ax is not None:
+            lines, labels = ax2.get_legend_handles_labels()
+            if overlay_ax is not None:
+                extra_lines, extra_labels = overlay_ax.get_legend_handles_labels()
+                lines += extra_lines
+                labels += extra_labels
+            if labels:
+                ax2.legend(lines, labels, fontsize=8, facecolor="#16213e", labelcolor="white", loc="upper right")
 
         # ── Right: progress bar + numeric panel
         ax3 = axes[2]
@@ -671,7 +1315,7 @@ def _make_loss_chart(metrics: list[dict], total_steps: int = 0, t_start: float =
                  ha="center", va="center", color="#cfd8e3", fontsize=11)
         ax3.text(50, 0.25, f"elapsed {elapsed_str}    ETA {eta_str}",
                  ha="center", va="center", color="#9aa6b2", fontsize=10)
-        ax3.text(50, 0.10, f"~{rate:.2f} steps/s avg",
+        ax3.text(50, 0.10, f"~{rate:.2f} {meta.get('speed_label', 'steps/s')} avg",
                  ha="center", va="center", color="#9aa6b2", fontsize=9)
         ax3.set_title("Progress & ETA", color="white", fontsize=11)
 
@@ -687,10 +1331,12 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
         register_translatable(tab, "tab.train")
 
         # ── Train owns its dataset choice (moved out of Config tab) ─
+        stage_help = gr.Markdown(_stage_text(STAGE_HELP_TEXT, "pretrain"))
         with gr.Row():
             data_path = gr.Textbox(
                 label=t("config.data_path"),
-                placeholder="./tests/fixtures/tiny_pretrain.jsonl",
+                value=STAGE_DEFAULT_DATA["pretrain"],
+                placeholder=STAGE_DEFAULT_DATA["pretrain"],
                 scale=3,
             )
             register_translatable(data_path, "config.data_path")
@@ -708,24 +1354,38 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
         # ── Mode + controls ───────────────────────────────────────
         with gr.Row():
             mode = gr.Radio(
-                ["pretrain", "sft", "rl", "orpo"],
+                STAGE_UI_ORDER,
                 value="pretrain", label=t("train.mode")
             )
             register_translatable(mode, "train.mode")
+            train_backend = gr.Dropdown(
+                choices=_train_backend_dropdown_choices(),
+                value=_default_train_backend_value(),
+                label=t("train.backend"),
+                scale=1,
+            )
+            register_translatable(train_backend, "train.backend")
             status_box = gr.Textbox(
                 value="idle", label=t("train.status"),
                 interactive=False, scale=1,
             )
             register_translatable(status_box, "train.status")
 
-        # ── Init-weight: required for SFT/RL/ORPO, optional for pretrain ──
+        # ── Init-weight / stage-specific extras ────────────────────
         with gr.Row():
             init_weight = gr.Textbox(
                 label=t("train.init_weight"),
-                placeholder="./out/chronos_768_moe.pth",
-                scale=4,
+                placeholder=_stage_init_placeholder("pretrain"),
+                scale=3,
             )
             register_translatable(init_weight, "train.init_weight")
+            teacher_path = gr.Textbox(
+                label=t("pipeline.teacher_path"),
+                placeholder=_distill_teacher_placeholder(),
+                visible=False,
+                scale=2,
+            )
+            register_translatable(teacher_path, "pipeline.teacher_path")
 
         with gr.Row():
             max_steps_in = gr.Number(
@@ -743,6 +1403,27 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
             register_translatable(max_steps_in,    "train.max_steps")
             register_translatable(val_ratio_in,    "train.val_ratio")
             register_translatable(weight_decay_in, "train.weight_decay")
+
+        with gr.Row():
+            reward_spec_in = gr.Textbox(
+                value="toy",
+                label="reward",
+                placeholder="toy or lm:/path/to/reward-model",
+                visible=False,
+                scale=2,
+            )
+            grpo_temp_in = gr.Number(
+                value=1.0, precision=3,
+                label="temperature",
+                visible=False,
+                scale=1,
+            )
+            grpo_num_gen_in = gr.Number(
+                value=4, precision=0,
+                label="num_generations",
+                visible=False,
+                scale=1,
+            )
 
         with gr.Row():
             sample_prompt_in = gr.Textbox(
@@ -768,14 +1449,11 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
         # ── Scalar readouts ───────────────────────────────────────
         with gr.Row():
             step_box     = gr.Number(label=t("train.step"),     value=0,   interactive=False, precision=0)
-            loss_box     = gr.Number(label=t("train.loss"),     value=0.0, interactive=False, precision=4)
-            ce_box       = gr.Number(label=t("train.ce_loss"),  value=0.0, interactive=False, precision=4)
-            aux_box      = gr.Number(label=t("train.aux_loss"), value=0.0, interactive=False, precision=4)
+            loss_box     = gr.Number(label=STAGE_METRIC_LABELS["pretrain"][0], value=0.0, interactive=False, precision=4)
+            ce_box       = gr.Number(label=STAGE_METRIC_LABELS["pretrain"][1], value=0.0, interactive=False, precision=4)
+            aux_box      = gr.Number(label=STAGE_METRIC_LABELS["pretrain"][2], value=0.0, interactive=False, precision=4)
             tps_box      = gr.Number(label=t("train.tps"),      value=0.0, interactive=False, precision=2)
             register_translatable(step_box, "train.step")
-            register_translatable(loss_box, "train.loss")
-            register_translatable(ce_box,   "train.ce_loss")
-            register_translatable(aux_box,  "train.aux_loss")
             register_translatable(tps_box,  "train.tps")
 
         # ── Scrollable log ────────────────────────────────────────
@@ -794,24 +1472,59 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
 
         # ── Callbacks ─────────────────────────────────────────────
 
-        def sync_sample_prompt(train_mode, current_prompt):
+        def sync_stage_fields(train_mode, current_prompt, current_data_path, current_init_weight):
             current = (current_prompt or "").strip()
+            default_upstream = STAGE_DEFAULT_INIT.get(train_mode, "")
+            help_md = _stage_text(STAGE_HELP_TEXT, train_mode)
+            data_default = STAGE_DEFAULT_DATA.get(train_mode, "")
+            metric_labels = STAGE_METRIC_LABELS.get(train_mode, STAGE_METRIC_LABELS["pretrain"])
+            init_placeholder = _stage_init_placeholder(train_mode)
+            current_data = (current_data_path or "").strip()
+            current_init = _normalize_stage_init_value(current_init_weight)
+            data_value = current_data
+            if (not current_data) or current_data in DEFAULT_STAGE_DATA_VALUES:
+                data_value = data_default
+            init_value = current_init
+            teacher_visible = train_mode == "distill"
+            reward_visible = train_mode == "grpo"
             if (not current) or current in DEFAULT_SAMPLE_PROMPT_VALUES:
-                return gr.update(
+                prompt_update = gr.update(
                     value=_stage_sample_prompt(train_mode),
                     placeholder=_stage_sample_prompt(train_mode),
                 )
-            return gr.update(placeholder=_stage_sample_prompt(train_mode))
+            else:
+                prompt_update = gr.update(placeholder=_stage_sample_prompt(train_mode))
+            return (
+                prompt_update,
+                gr.update(value=help_md),
+                gr.update(value=data_value, placeholder=data_default),
+                gr.update(value=init_value, placeholder=init_placeholder),
+                gr.update(visible=teacher_visible, placeholder=_distill_teacher_placeholder()),
+                gr.update(visible=reward_visible),
+                gr.update(visible=reward_visible),
+                gr.update(visible=reward_visible),
+                gr.update(label=metric_labels[0]),
+                gr.update(label=metric_labels[1]),
+                gr.update(label=metric_labels[2]),
+            )
 
-        def start_training(cfg, train_mode, dpath, iw, ms, vr, wd, sp):
+        def start_training(cfg, train_mode, selected_backend, dpath, iw, ms, vr, wd, reward_spec, grpo_temp, grpo_num_gen, teacher, sp):
             if _session.is_running():
                 return "already running", 0, 0.0, 0.0, 0.0, 0.0, "Already running.\n", None, ""
             cfg = dict(cfg) if cfg else {}
+            requested_backend = (selected_backend or "auto").strip().lower() or "auto"
+            _, resolved_device = resolve_training_device(requested_backend)
+            cfg["train_backend"] = requested_backend
+            cfg["device"] = resolved_device
             cfg["data_path"] = dpath or cfg.get("data_path", "")
-            cfg["init_weight"] = iw or ""
+            cfg["init_weight"] = _normalize_stage_init_value(iw)
             cfg["max_steps"] = int(ms or 0)
             cfg["val_ratio"] = float(vr or 0.0)
             cfg["weight_decay"] = float(wd or 0.0)
+            cfg["reward_spec"] = reward_spec or "toy"
+            cfg["temperature"] = float(grpo_temp or 1.0)
+            cfg["num_generations"] = int(grpo_num_gen or 4)
+            cfg["teacher_path"] = teacher or ""
             cfg["sample_prompt"] = sp or ""
             _session.start(cfg, train_mode)
             return "running", 0, 0.0, 0.0, 0.0, 0.0, "Starting...\n", None, ""
@@ -823,7 +1536,7 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
         def clear_log():
             return ""
 
-        def poll(current_log: str):
+        def poll(current_log: str, current_mode: str):
             new_lines = _session.drain_log()
             # Append new lines to existing log; keep last 500 lines to avoid unbounded growth
             if new_lines:
@@ -836,13 +1549,13 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
                 combined = "\n".join(lines[-500:])
 
             metrics = _session.get_metrics()
-            fig = _make_loss_chart(metrics, _session.total_steps, _session.t_start)
+            fig = _make_loss_chart(metrics, current_mode, _session.total_steps, _session.t_start)
 
             # Latest scalar values from last metric entry
             if metrics:
                 last = metrics[-1]
-                ce_v = last.get("ce", 0.0)
-                aux_v = last.get("aux", 0.0)
+                ce_v = last.get("primary", last.get("ce", 0.0))
+                aux_v = last.get("secondary", last.get("aux", 0.0))
                 tps_v = last.get("tps", 0.0)
             else:
                 ce_v = aux_v = tps_v = 0.0
@@ -860,15 +1573,20 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
             )
 
         mode.change(
-            fn=sync_sample_prompt,
-            inputs=[mode, sample_prompt_in],
-            outputs=[sample_prompt_in],
+            fn=sync_stage_fields,
+            inputs=[mode, sample_prompt_in, data_path, init_weight],
+            outputs=[
+                sample_prompt_in, stage_help, data_path, init_weight,
+                teacher_path, reward_spec_in, grpo_temp_in, grpo_num_gen_in,
+                loss_box, ce_box, aux_box,
+            ],
         )
 
         start_btn.click(
             fn=start_training,
-            inputs=[config_state, mode, data_path, init_weight,
+            inputs=[config_state, mode, train_backend, data_path, init_weight,
                     max_steps_in, val_ratio_in, weight_decay_in,
+                    reward_spec_in, grpo_temp_in, grpo_num_gen_in, teacher_path,
                     sample_prompt_in],
             outputs=[status_box, step_box, loss_box, ce_box, aux_box, tps_box,
                      log_box, chart, sample_box],
@@ -879,7 +1597,7 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
         timer = gr.Timer(value=2.0)
         timer.tick(
             fn=poll,
-            inputs=[log_box],
+            inputs=[log_box, mode],
             outputs=[status_box, step_box, loss_box, ce_box, aux_box, tps_box,
                      log_box, chart, sample_box],
         )

@@ -9,6 +9,163 @@ import chronos.deps  # auto-bootstrap minimind on sys.path
 from ui.i18n import t, register_translatable
 
 
+INFERENCE_BACKEND_CHOICES = ("mlx", "cuda", "xpu", "mps", "cpu")
+TORCH_INFERENCE_PRIORITY = ("cuda", "xpu", "mps", "cpu")
+
+
+def _best_torch_inference_backend() -> str:
+    from chronos.backend import BackendDispatcher
+
+    d = BackendDispatcher()
+    for name in TORCH_INFERENCE_PRIORITY:
+        if d.info(name).available:
+            return name
+    return "cpu"
+
+
+def _available_inference_backend_choices() -> list[str]:
+    from chronos.backend import available
+
+    detected = set(available())
+    return ["auto"] + [name for name in INFERENCE_BACKEND_CHOICES if name in detected]
+
+
+def _default_inference_backend_value() -> str:
+    return "auto"
+
+
+def _resolve_inference_backend(requested_backend: str, model_path_val: str, sniffed: dict) -> tuple[str, str]:
+    from chronos.backend import select
+
+    requested = (requested_backend or "auto").strip().lower() or "auto"
+    backend = select(None if requested == "auto" else requested)
+    note = ""
+
+    if requested not in {"", "auto"} and backend != requested:
+        note = (
+            f"[backend fallback] Requested {requested}, but it is not available; "
+            f"using {backend}.\n"
+        )
+
+    # Current MLX inference in this repo does not have a lossless
+    # PyTorch-.pth loader. If we detected a standard Chronos checkpoint,
+    # prefer a torch backend so the weights actually load.
+    if backend == "mlx" and sniffed:
+        fallback = _best_torch_inference_backend()
+        if fallback != "mlx":
+            backend = fallback
+            note = note + (
+                f"[backend fallback] Detected a PyTorch Chronos checkpoint at {model_path_val}; "
+                f"using {backend} because the current MLX .pth import path is not lossless.\n"
+            )
+    return backend, note
+
+
+def _checkpoint_expert_cache_dir(model_path_val: str, model_cfg) -> str:
+    """Keep lazy expert shards isolated per checkpoint.
+
+    Reusing a single ./expert_cache across different .pth files can silently
+    load stale expert shards. The cache key uses path + stat metadata + core
+    topology so repeated runs reuse the same shards, while changed checkpoints
+    get a clean cache namespace.
+    """
+    import hashlib
+    import os
+
+    base = os.path.join(os.getcwd(), "expert_cache")
+    if not model_path_val or not os.path.exists(model_path_val):
+        return base
+    try:
+        st = os.stat(model_path_val)
+    except OSError:
+        return base
+    topology = (
+        getattr(model_cfg, "vocab_size", ""),
+        getattr(model_cfg, "hidden_size", ""),
+        getattr(model_cfg, "num_hidden_layers", ""),
+        getattr(model_cfg, "num_experts", ""),
+        getattr(model_cfg, "moe_intermediate_size", ""),
+    )
+    raw = f"{os.path.abspath(model_path_val)}:{st.st_size}:{st.st_mtime_ns}:{topology}"
+    key = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(base, f"ckpt_{key}")
+
+
+def _replace_torch_experts_with_placeholders(model, model_cfg) -> None:
+    """Remove randomly initialised live experts before model.to(device).
+
+    For .pth inference the real expert tensors are sharded from the checkpoint
+    to SSD by ChronosInferenceEngine.setup_from_state_dict(). Keeping the
+    constructor's random experts alive until model.to(mps/cuda) defeats the
+    SSD+DRAM lazy-load design by moving full dummy experts onto the device.
+    """
+    import torch
+    from chronos.model.moe_chronos import ChronosMOEFeedForward, LazyExpertPlaceholder
+
+    layers = getattr(getattr(model, "model", None), "layers", [])
+    hidden = int(getattr(model_cfg, "hidden_size", 0) or 0)
+    intermediate = int(getattr(model_cfg, "moe_intermediate_size", 0) or 0)
+    if not hidden or not intermediate:
+        return
+    for layer in layers:
+        moe = getattr(layer, "mlp", None)
+        if not isinstance(moe, ChronosMOEFeedForward):
+            continue
+        for idx in range(len(moe.experts)):
+            moe.experts[idx] = LazyExpertPlaceholder(hidden, intermediate, torch.float16)
+
+
+def _run_torch_inference(backend: str, model_cfg, model_path_val: str, token_ids: list[int],
+                         max_tok: int, temp: float, eos_token_id: int | None) -> list[int]:
+    import os
+    import torch
+    from chronos.model.model_chronos import ChronosForCausalLM
+    from chronos.runtime.inference_engine import ChronosInferenceEngine
+
+    model = ChronosForCausalLM(model_cfg)
+    weights = None
+    if model_path_val and os.path.exists(model_path_val):
+        weights = torch.load(model_path_val, map_location="cpu")
+        base_only = {
+            k: v for k, v in weights.items()
+            if ".mlp.experts." not in k
+        }
+        model.load_state_dict(base_only, strict=False)
+        _replace_torch_experts_with_placeholders(model, model_cfg)
+
+    device_map = {"cuda": "cuda", "xpu": "xpu", "mps": "mps", "cpu": "cpu"}[backend]
+    model = model.to(device_map).eval()
+    input_ids = torch.tensor([token_ids]).to(device_map)
+    engine = ChronosInferenceEngine(
+        model,
+        model_cfg,
+        ssd_dir=_checkpoint_expert_cache_dir(model_path_val, model_cfg),
+    )
+    if weights is not None:
+        engine.setup_from_state_dict(weights, warm_expert_ids=[])
+        del weights
+        weights = None
+        import gc
+        gc.collect()
+    else:
+        engine.setup(warm_expert_ids=[])
+
+    try:
+        out = engine.generate(
+            input_ids,
+            max_new_tokens=int(max_tok),
+            temperature=float(temp),
+            eos_token_id=eos_token_id,
+        )
+    finally:
+        engine.teardown()
+
+    prompt_len = input_ids.shape[1]
+    generated = out[0, prompt_len:].tolist()
+
+    return generated
+
+
 def build_inference_tab(config_state: gr.State):
     with gr.Tab(t("tab.inference")) as tab:
         register_translatable(tab, "tab.inference")
@@ -25,8 +182,14 @@ def build_inference_tab(config_state: gr.State):
         register_translatable(prompt, "infer.prompt")
 
         with gr.Row():
+            inference_backend = gr.Dropdown(
+                choices=_available_inference_backend_choices(),
+                value=_default_inference_backend_value(),
+                label=t("infer.backend"),
+            )
             max_tokens  = gr.Slider(16, 512, value=128, step=16, label=t("infer.max_tokens"))
             temperature = gr.Slider(0.1, 2.0, value=0.85, step=0.05, label=t("infer.temperature"))
+            register_translatable(inference_backend, "infer.backend")
             register_translatable(max_tokens,  "infer.max_tokens")
             register_translatable(temperature, "infer.temperature")
 
@@ -101,21 +264,63 @@ def build_inference_tab(config_state: gr.State):
                     out["num_attention_heads_total_dim"] = int(qw.shape[0])
                     out["num_kv_heads_total_dim"] = int(kw.shape[0])
 
-                # MLA: sniff rope_dim from q_rope_proj shape
-                #   q_rope_proj.weight: (n_heads * rope_dim, hidden)
+                # MLA attention uses split query and latent KV projections:
+                #   q_nope_proj: (n_heads * nope_dim, hidden)
+                #   q_rope_proj: (n_heads * rope_dim, hidden)
+                #   kv_down_proj: (kv_latent_dim, hidden)
+                #   v_proj: (n_kv_heads * head_dim, kv_latent_dim)
+                qnope = sd.get("model.layers.0.self_attn.q_nope_proj.weight")
                 qrope = sd.get("model.layers.0.self_attn.q_rope_proj.weight")
-                if qrope is not None and out.get("num_attention_heads_total_dim"):
-                    # We know n_heads*head_dim = total_dim, rope_dim divides that
-                    # ratio cleanly. Fall back: take (qrope.shape[0] / n_heads_guess).
-                    pass  # rope_dim passed in via model_cfg_kwargs below
+                kvdown = sd.get("model.layers.0.self_attn.kv_down_proj.weight")
+                vproj = sd.get("model.layers.0.self_attn.v_proj.weight")
+                if qnope is not None and qrope is not None and out.get("hidden_size"):
+                    total_q = int(qnope.shape[0] + qrope.shape[0])
+                    h = out["hidden_size"]
+                    if total_q > 0 and h % total_q == 0:
+                        # For MiniMind/Chronos checkpoints head_dim is
+                        # hidden_size / num_attention_heads, so total_q equals
+                        # hidden_size and n_heads is recovered by divisibility.
+                        pass
+                    candidates = [
+                        n for n in range(1, out["hidden_size"] + 1)
+                        if out["hidden_size"] % n == 0
+                        and int(qrope.shape[0]) % n == 0
+                        and int(qnope.shape[0]) % n == 0
+                    ]
+                    if candidates:
+                        # Prefer the configured/default 8 when valid; else
+                        # choose the largest plausible head count.
+                        preferred = 8 if 8 in candidates else max(candidates)
+                        head_dim = out["hidden_size"] // preferred
+                        rope_dim = int(qrope.shape[0]) // preferred
+                        nope_dim = int(qnope.shape[0]) // preferred
+                        if rope_dim + nope_dim == head_dim:
+                            out["num_attention_heads"] = preferred
+                            out["rope_dim"] = rope_dim
+                            out["num_attention_heads_total_dim"] = preferred * head_dim
+                if kvdown is not None:
+                    out["kv_latent_dim"] = int(kvdown.shape[0])
+                if vproj is not None and out.get("kv_latent_dim"):
+                    head_dim = out.get("hidden_size", 0) // max(out.get("num_attention_heads", 8), 1)
+                    if head_dim > 0:
+                        out["num_key_value_heads"] = max(1, int(vproj.shape[0]) // head_dim)
+                        out["num_kv_heads_total_dim"] = int(vproj.shape[0])
+
+                # Odd layers are SlidingWindowAttention in the hybrid stack.
+                # If layer 1 exists, its q/k projection shapes are a direct
+                # source of head counts and should override weaker defaults.
+                sw_q = sd.get("model.layers.1.self_attn.q_proj.weight")
+                sw_k = sd.get("model.layers.1.self_attn.k_proj.weight")
+                if sw_q is not None and sw_k is not None and out.get("hidden_size"):
+                    out["num_attention_heads_total_dim"] = int(sw_q.shape[0])
+                    out["num_kv_heads_total_dim"] = int(sw_k.shape[0])
                 return out
             except Exception:
                 return {}
 
-        def generate(cfg, model_path_val, prompt_val, max_tok, temp):
+        def generate(cfg, selected_backend, model_path_val, prompt_val, max_tok, temp):
             from transformers import AutoTokenizer
             from chronos.model.config import ChronosConfig
-            from chronos.backend import get_backend
 
             if not prompt_val.strip():
                 return "Please enter a prompt.", 0.0
@@ -151,12 +356,18 @@ def build_inference_tab(config_state: gr.State):
                     "num_experts_per_tok":  cfg.get("num_experts_per_tok", 1),
                     "num_shared_experts":   cfg.get("num_shared_experts", 1),
                     "lookahead_steps":      cfg.get("lookahead_steps", 2),
-                    "kv_latent_dim":        cfg.get("kv_latent_dim", 64),
+                    "kv_latent_dim":        sniffed.get("kv_latent_dim", cfg.get("kv_latent_dim", 64)),
                     "sliding_window_size":  cfg.get("sliding_window_size", 2048),
                     "use_hybrid_attention": cfg.get("use_hybrid_attention", True),
                     "vram_budget_gb":       cfg.get("vram_budget_gb", 4.0),
                     "use_moe": True,
                 }
+                if "rope_dim" in sniffed:
+                    model_cfg_kwargs["rope_dim"] = sniffed["rope_dim"]
+                if "num_attention_heads" in sniffed:
+                    model_cfg_kwargs["num_attention_heads"] = sniffed["num_attention_heads"]
+                if "num_key_value_heads" in sniffed:
+                    model_cfg_kwargs["num_key_value_heads"] = sniffed["num_key_value_heads"]
                 if "vocab_size" in sniffed:
                     model_cfg_kwargs["vocab_size"] = sniffed["vocab_size"]
                 if "moe_intermediate_size" in sniffed:
@@ -170,6 +381,9 @@ def build_inference_tab(config_state: gr.State):
                     ("max_position_embeddings", "max_seq_len"),
                     ("tie_word_embeddings",   "tie_word_embeddings"),
                 ]:
+                    if opt_key in {"num_attention_heads", "num_key_value_heads", "rope_dim"} \
+                            and opt_key in model_cfg_kwargs:
+                        continue
                     if cfg_key not in cfg:
                         continue
                     val = cfg[cfg_key]
@@ -194,7 +408,7 @@ def build_inference_tab(config_state: gr.State):
 
                 model_cfg = ChronosConfig(**model_cfg_kwargs)
 
-                backend = get_backend()
+                backend, backend_note = _resolve_inference_backend(selected_backend, model_path_val, sniffed)
                 tokenizer = AutoTokenizer.from_pretrained(chronos.deps.get_tokenizer_path())
                 token_ids = tokenizer.encode(prompt_val)
                 generated = []
@@ -232,37 +446,20 @@ def build_inference_tab(config_state: gr.State):
                     engine.stop()
 
                 else:
-                    import torch
-                    from chronos.model.model_chronos import ChronosForCausalLM
-
-                    model = ChronosForCausalLM(model_cfg)
-                    if model_path_val and __import__("os").path.exists(model_path_val):
-                        weights = torch.load(model_path_val, map_location="cpu")
-                        model.load_state_dict(weights, strict=False)
-
-                    device_map = {"cuda": "cuda", "mps": "mps", "cpu": "cpu"}[backend]
-                    model = model.to(device_map).eval()
-                    input_ids = torch.tensor([token_ids]).to(device_map)
-
-                    with torch.no_grad():
-                        out, lp = model(input_ids, use_cache=True)
-                        past_kv = out.past_key_values
-                        for _ in range(int(max_tok)):
-                            logits = out.logits[:, -1, :] / float(temp)
-                            next_tok = torch.multinomial(
-                                torch.softmax(logits, dim=-1), num_samples=1
-                            )
-                            generated.append(next_tok.item())
-                            if next_tok.item() == tokenizer.eos_token_id:
-                                break
-                            out2, lp2 = model(next_tok, past_key_values=past_kv, use_cache=True)
-                            past_kv = out2.past_key_values
-                            out = out2
+                    generated = _run_torch_inference(
+                        backend,
+                        model_cfg,
+                        model_path_val,
+                        token_ids,
+                        int(max_tok),
+                        float(temp),
+                        tokenizer.eos_token_id,
+                    )
 
                 elapsed = time.monotonic() - t0
                 tps = len(generated) / max(elapsed, 1e-6)
                 decoded = tokenizer.decode(generated, skip_special_tokens=True)
-                return f"{sniff_note}[{backend}] {decoded}", round(tps, 1)
+                return f"{backend_note}{sniff_note}[{backend}] {decoded}", round(tps, 1)
 
             except Exception as e:
                 import traceback
@@ -292,7 +489,7 @@ def build_inference_tab(config_state: gr.State):
 
         gen_btn.click(
             fn=generate,
-            inputs=[config_state, model_path, prompt, max_tokens, temperature],
+            inputs=[config_state, inference_backend, model_path, prompt, max_tokens, temperature],
             outputs=[output_box, tps_box],
         )
 

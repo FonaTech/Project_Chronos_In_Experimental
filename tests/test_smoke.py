@@ -13,6 +13,7 @@ import chronos.deps  # auto-bootstrap minimind on sys.path
 
 import torch
 from torch.utils.data import DataLoader, TensorDataset
+from unittest import mock
 
 
 
@@ -82,6 +83,29 @@ def test_expert_store_init():
     assert s['vram_capacity'] >= 1
     assert s['ram_capacity_dynamic'] >= 1
     assert 'available_ram_gb' in s
+
+
+def test_lazy_expert_placeholder_uses_shared_fallback():
+    from chronos.model.config import ChronosConfig
+    from chronos.model.model_chronos import ChronosForCausalLM
+    from chronos.model.moe_chronos import LazyExpertPlaceholder
+
+    cfg = ChronosConfig(
+        hidden_size=32, num_hidden_layers=1, num_experts=2,
+        num_experts_per_tok=1, num_shared_experts=1,
+        num_attention_heads=2, num_key_value_heads=2,
+        kv_latent_dim=8, rope_dim=4, max_seq_len=16,
+        vocab_size=128, use_moe=True,
+    )
+    model = ChronosForCausalLM(cfg).eval()
+    moe = model.model.layers[0].mlp
+    moe.experts[0] = LazyExpertPlaceholder(cfg.hidden_size, cfg.moe_intermediate_size, torch.float32)
+
+    x = torch.randn(1, 4, cfg.hidden_size)
+    mask = torch.tensor([0.0, 1.0])
+    with torch.no_grad():
+        y = moe(x, available_expert_mask=mask)
+    assert y.shape == x.shape
 
 
 def test_async_prefetcher():
@@ -281,6 +305,31 @@ def test_pipeline_overlap_simulated():
     assert legacy_blocked_ms >= 25, f"legacy step() did not block on SSD (got {legacy_blocked_ms:.1f}ms)"
 
 
+def test_setup_from_state_dict_replaces_live_experts_with_placeholders():
+    import tempfile
+    from chronos.model.config import ChronosConfig
+    from chronos.model.model_chronos import ChronosForCausalLM
+    from chronos.model.moe_chronos import LazyExpertPlaceholder
+    from chronos.runtime.inference_engine import ChronosInferenceEngine
+
+    cfg = ChronosConfig(
+        hidden_size=32, num_hidden_layers=1, num_experts=4,
+        use_moe=True, use_hybrid_attention=True,
+        kv_latent_dim=8, rope_dim=4, sliding_window_size=16,
+        vram_budget_gb=0.01, num_shared_experts=1,
+        num_attention_heads=2, num_key_value_heads=2,
+        max_seq_len=16, vocab_size=128,
+        storage_format="pt",
+    )
+    model = ChronosForCausalLM(cfg).eval()
+    state = model.state_dict()
+    engine = ChronosInferenceEngine(model, cfg, ssd_dir=tempfile.mkdtemp(prefix="chronos_lazy_setup_"))
+    engine.setup_from_state_dict(state, warm_expert_ids=[])
+    expert0 = model.model.layers[0].mlp.experts[0]
+    assert isinstance(expert0, LazyExpertPlaceholder)
+    engine.teardown()
+
+
 # ── M5/M6 tests ───────────────────────────────────────────────────
 
 def test_backend_dispatcher():
@@ -290,10 +339,241 @@ def test_backend_dispatcher():
     assert "cpu" in avail, f"cpu must be available, got {avail}"
     assert d.device_str("cpu") == "cpu"
     assert d.supports_training("cpu") is True
+    assert d.supports_training("mlx") is False  # inference-only in current repo
     assert d.supports_training("vulkan") is False  # no upstream autograd
     assert d.info("opencl").available is False     # stub
     sel = d.select()
     assert sel in avail
+
+
+def test_training_backend_resolver():
+    from chronos.backend import BackendDispatcher
+    d = BackendDispatcher()
+
+    fake_infos = {
+        "cuda": mock.Mock(available=False, supports_training=False, torch_device=None),
+        "xpu": mock.Mock(available=False, supports_training=False, torch_device=None),
+        "mps": mock.Mock(available=True, supports_training=True, torch_device="mps"),
+        "cpu": mock.Mock(available=True, supports_training=True, torch_device="cpu"),
+        "mlx": mock.Mock(available=True, supports_training=False, torch_device=None),
+    }
+
+    with mock.patch.object(d, "info", side_effect=lambda name: fake_infos.get(name, mock.Mock(available=False, supports_training=False, torch_device=None))):
+        assert d.training_available() == ["mps", "cpu"]
+        assert d.select_training() == "mps"
+        assert d.select_training("auto") == "mps"
+        assert d.select_training("cpu") == "cpu"
+        assert d.select_training("mlx") == "mps"
+        assert d.training_device_str("mps") == "mps"
+        assert d.resolve_training_device("auto") == ("mps", "mps")
+        assert d.resolve_training_device("cpu") == ("cpu", "cpu")
+
+
+def test_train_backend_choice_helpers():
+    from ui.tabs.train_tab import (
+        _available_train_backend_choices,
+        _train_backend_dropdown_choices,
+    )
+
+    with mock.patch("ui.tabs.train_tab.training_available", return_value=["mps", "cpu"]):
+        assert _available_train_backend_choices() == ["auto", "mps", "cpu"]
+        choices = _train_backend_dropdown_choices("en")
+        assert choices[0][1] == "auto"
+        assert [value for _, value in choices] == ["auto", "mps", "cpu"]
+
+
+def test_inference_falls_back_from_mlx_for_pytorch_checkpoint():
+    from ui.tabs import inference_tab as mod
+
+    assert mod.TORCH_INFERENCE_PRIORITY[0] == "cuda"
+
+    with mock.patch("chronos.backend.select", return_value="mlx"):
+        with mock.patch("ui.tabs.inference_tab._best_torch_inference_backend", return_value="mps"):
+            backend, note = mod._resolve_inference_backend("auto", "./out/foo.pth", {"hidden_size": 384})
+            assert backend == "mps"
+            assert "not lossless" in note
+
+    with mock.patch("chronos.backend.select", return_value="mlx"):
+        backend, note = mod._resolve_inference_backend("auto", "./out/foo.pth", {})
+        assert backend == "mlx"
+        assert note == ""
+
+    with mock.patch("chronos.backend.select", return_value="cuda"):
+        backend, note = mod._resolve_inference_backend("auto", "./out/foo.pth", {"hidden_size": 384})
+        assert backend == "cuda"
+        assert note == ""
+
+    with mock.patch("chronos.backend.select", return_value="cpu"):
+        backend, note = mod._resolve_inference_backend("cuda", "./out/foo.pth", {})
+        assert backend == "cpu"
+        assert "Requested cuda" in note
+
+
+def test_inference_backend_choice_helpers():
+    from ui.tabs.inference_tab import (
+        _available_inference_backend_choices,
+        _default_inference_backend_value,
+    )
+
+    with mock.patch("chronos.backend.available", return_value=["mlx", "mps", "cpu"]):
+        assert _available_inference_backend_choices() == ["auto", "mlx", "mps", "cpu"]
+        assert _default_inference_backend_value() == "auto"
+
+
+def test_cuda_inference_path_uses_cuda_device_map():
+    from ui.tabs import inference_tab as mod
+
+    class _FakeTensor:
+        def __init__(self, item_value=7):
+            self.devices = []
+            self.item_value = item_value
+
+        def to(self, device):
+            self.devices.append(device)
+            return self
+
+        @property
+        def shape(self):
+            return (1, 3)
+
+        def tolist(self):
+            return [[1, 2, 3, self.item_value]]
+
+        def __getitem__(self, _key):
+            return mock.Mock(tolist=mock.Mock(return_value=[self.item_value]))
+
+    class _FakeModel:
+        def __init__(self):
+            self.devices = []
+            self.eval_called = False
+
+        def load_state_dict(self, _weights, strict=False):
+            return None
+
+        def to(self, device):
+            self.devices.append(device)
+            return self
+
+        def eval(self):
+            self.eval_called = True
+            return self
+
+    class _FakeEngine:
+        def __init__(self, _model, _cfg, ssd_dir=None):
+            self.setup_called = False
+
+        def setup(self, warm_expert_ids=None):
+            self.setup_called = True
+
+        def setup_from_state_dict(self, _state, warm_expert_ids=None):
+            self.setup_called = True
+
+        def generate(self, input_ids, **_kwargs):
+            return input_ids
+
+        def teardown(self):
+            return None
+
+    fake_model = _FakeModel()
+    fake_input = _FakeTensor(item_value=11)
+    fake_torch = mock.Mock()
+    fake_torch.tensor = mock.Mock(return_value=fake_input)
+    fake_torch.load = mock.Mock(return_value={})
+
+    with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+        with mock.patch("chronos.model.model_chronos.ChronosForCausalLM", return_value=fake_model):
+            with mock.patch("chronos.runtime.inference_engine.ChronosInferenceEngine", _FakeEngine):
+                generated = mod._run_torch_inference(
+                    "cuda",
+                    model_cfg=object(),
+                    model_path_val="",
+                    token_ids=[1, 2, 3],
+                    max_tok=1,
+                    temp=0.8,
+                    eos_token_id=99,
+                )
+
+    assert generated == [11]
+    assert fake_model.devices == ["cuda"]
+    assert fake_model.eval_called is True
+    assert fake_input.devices == ["cuda"]
+    fake_torch.tensor.assert_called_once()
+
+
+def test_torch_inference_loads_base_only_before_lazy_setup():
+    from ui.tabs import inference_tab as mod
+
+    captured = {}
+
+    class _FakeTensor:
+        def to(self, _device):
+            return self
+
+        @property
+        def shape(self):
+            return (1, 3)
+
+        def tolist(self):
+            return [[1, 2, 3]]
+
+        def __getitem__(self, _key):
+            return mock.Mock(tolist=mock.Mock(return_value=[]))
+
+    class _FakeModel:
+        def load_state_dict(self, weights, strict=False):
+            captured["loaded_keys"] = sorted(weights.keys())
+            captured["strict"] = strict
+
+        def to(self, _device):
+            return self
+
+        def eval(self):
+            return self
+
+    class _FakeEngine:
+        def __init__(self, _model, _cfg, ssd_dir=None):
+            pass
+
+        def setup_from_state_dict(self, state, warm_expert_ids=None):
+            captured["setup_keys"] = sorted(state.keys())
+
+        def setup(self, warm_expert_ids=None):
+            captured["setup_called"] = True
+
+        def generate(self, input_ids, **_kwargs):
+            return input_ids
+
+        def teardown(self):
+            captured["teardown"] = True
+
+    fake_state = {
+        "model.embed_tokens.weight": torch.zeros(4, 4),
+        "model.layers.0.mlp.experts.0.gate_proj.weight": torch.zeros(4, 4),
+        "model.layers.0.mlp.experts.0.up_proj.weight": torch.zeros(4, 4),
+    }
+    fake_torch = mock.Mock()
+    fake_torch.tensor = mock.Mock(return_value=_FakeTensor())
+    fake_torch.load = mock.Mock(return_value=fake_state)
+
+    with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+        with mock.patch("os.path.exists", return_value=True):
+            with mock.patch("chronos.model.model_chronos.ChronosForCausalLM", return_value=_FakeModel()):
+                with mock.patch("chronos.runtime.inference_engine.ChronosInferenceEngine", _FakeEngine):
+                    out = mod._run_torch_inference(
+                        "cpu",
+                        model_cfg=object(),
+                        model_path_val="/tmp/fake.pth",
+                        token_ids=[1, 2, 3],
+                        max_tok=4,
+                        temp=0.8,
+                        eos_token_id=99,
+                    )
+
+    assert out == []
+    assert captured["strict"] is False
+    assert captured["loaded_keys"] == ["model.embed_tokens.weight"]
+    assert any(".mlp.experts." in key for key in captured["setup_keys"])
+    assert captured["teardown"] is True
 
 
 def test_param_estimator():
@@ -361,6 +641,86 @@ def test_ui_build():
     from chronos.app import build_app
     app = build_app()
     assert app is not None
+
+
+def test_webui_launch_port_wiring():
+    """The app exposes a single WebUI port; verify CLI args are passed
+    through to Gradio launch unchanged."""
+    import chronos.app as app_mod
+
+    captured = {}
+
+    class _FakeApp:
+        def launch(self, **kwargs):
+            captured.update(kwargs)
+
+    with mock.patch.object(app_mod, "build_app", return_value=_FakeApp()):
+        with mock.patch.object(sys, "argv", [
+            "chronos.app", "--port", "7867", "--host", "0.0.0.0", "--share"
+        ]):
+            app_mod.main()
+
+    assert captured["server_port"] == 7867
+    assert captured["server_name"] == "0.0.0.0"
+    assert captured["share"] is True
+    assert captured["show_error"] is True
+
+
+def test_stage_entry_mappings_consistent():
+    """Train tab and Pipeline tab must point each stage at the same
+    upstream init, data fixture, and entry script."""
+    from ui.tabs.train_tab import STAGE_UI_ORDER, STAGE_DEFAULT_DATA, STAGE_DEFAULT_INIT
+    from ui.tabs.pipeline_tab import STAGES
+
+    display_to_mode = {
+        "Pretrain": "pretrain",
+        "SFT": "sft",
+        "DPO": "dpo",
+        "ORPO": "orpo",
+        "GRPO": "grpo",
+        "Distill": "distill",
+    }
+    expected_scripts = {
+        "pretrain": "train_chronos.py",
+        "sft": "train_chronos_sft.py",
+        "dpo": "train_chronos_dpo.py",
+        "orpo": "train_chronos_orpo.py",
+        "grpo": "train_chronos_grpo.py",
+        "distill": "train_chronos_distill.py",
+    }
+
+    def _norm_relpath(path: str) -> str:
+        return path[2:] if path.startswith("./") else path
+
+    pipeline_modes = [display_to_mode[name] for name, *_ in STAGES]
+    assert pipeline_modes == STAGE_UI_ORDER
+
+    for name, script, from_weight, data_path, takes_teacher in STAGES:
+        mode = display_to_mode[name]
+        assert script == expected_scripts[mode]
+        assert from_weight == STAGE_DEFAULT_INIT.get(mode, "")
+        assert _norm_relpath(data_path) == _norm_relpath(STAGE_DEFAULT_DATA[mode])
+        assert takes_teacher is (mode == "distill")
+
+
+def test_pipeline_backend_choices_include_auto():
+    from ui.tabs.pipeline_tab import PIPELINE_TRAIN_BACKEND_CHOICES
+
+    assert PIPELINE_TRAIN_BACKEND_CHOICES[0] == "auto"
+
+
+def test_stage_init_placeholder_means_auto_resolution():
+    """Legacy placeholder paths should normalize back to blank so the
+    runtime resolves the previous stage dynamically from save_dir."""
+    from ui.tabs.train_tab import _normalize_stage_init_value, _stage_init_placeholder
+
+    assert _normalize_stage_init_value("") == ""
+    assert _normalize_stage_init_value("./out/chronos_768_moe.pth") == ""
+    assert _normalize_stage_init_value("./out/sft_768_moe.pth") == ""
+    assert _normalize_stage_init_value("./custom/model.pth") == "./custom/model.pth"
+
+    assert "auto" in _stage_init_placeholder("pretrain").lower()
+    assert "override" in _stage_init_placeholder("grpo").lower()
 
 
 def test_shared_expert_grad():
@@ -431,6 +791,7 @@ if __name__ == '__main__':
         test_temporal_loss,
         test_lru_cache,
         test_expert_store_init,
+        test_lazy_expert_placeholder_uses_shared_fallback,
         test_async_prefetcher,
         test_hybrid_attention_layers,
         test_benchmark_functions,
@@ -438,12 +799,23 @@ if __name__ == '__main__':
         test_expert_store_clustered_prefetch,
         test_lookahead_supervision_grad,
         test_pipeline_overlap_simulated,
+        test_setup_from_state_dict_replaces_live_experts_with_placeholders,
         test_backend_dispatcher,
+        test_training_backend_resolver,
+        test_train_backend_choice_helpers,
+        test_inference_falls_back_from_mlx_for_pytorch_checkpoint,
+        test_inference_backend_choice_helpers,
+        test_cuda_inference_path_uses_cuda_device_map,
+        test_torch_inference_loads_base_only_before_lazy_setup,
         test_param_estimator,
         test_metrics_bus,
         test_vllm_adapter_no_vllm,
         test_hf_save_load_roundtrip,
         test_ui_build,
+        test_webui_launch_port_wiring,
+        test_stage_entry_mappings_consistent,
+        test_pipeline_backend_choices_include_auto,
+        test_stage_init_placeholder_means_auto_resolution,
         test_shared_expert_grad,
         test_optimizer_decay_groups,
         test_warmup_lr_schedule,

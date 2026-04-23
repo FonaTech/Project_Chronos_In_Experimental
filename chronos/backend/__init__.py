@@ -10,9 +10,15 @@ from chronos.backend.dispatcher import (
     BackendInfo,
     available,
     select,
+    training_available,
+    select_training,
     device_str,
+    training_device_str,
+    resolve_training_device,
     describe,
+    describe_training,
     AUTO_PRIORITY,
+    TRAINING_AUTO_PRIORITY,
 )
 
 # Back-compat shim for the pre-M5 API that code elsewhere still calls.
@@ -26,6 +32,9 @@ def get_backend():
 
 __all__ = [
     "BackendDispatcher", "BackendInfo",
-    "available", "select", "device_str", "describe", "AUTO_PRIORITY",
+    "available", "select", "training_available", "select_training",
+    "device_str", "training_device_str", "resolve_training_device",
+    "describe", "describe_training",
+    "AUTO_PRIORITY", "TRAINING_AUTO_PRIORITY",
     "get_backend", "build_model", "BackendType",
 ]

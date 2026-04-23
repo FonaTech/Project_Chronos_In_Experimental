@@ -10,6 +10,25 @@ from model.model_minimind import FeedForward, MOEFeedForward
 from .config import ChronosConfig
 
 
+class LazyExpertPlaceholder(nn.Module):
+    """Inference-only placeholder for experts that live on SSD/RAM.
+
+    If this module executes directly, Chronos failed to materialize the
+    expert before use or failed to route the token through the shared
+    expert fallback. That is a correctness bug, so we raise loudly.
+    """
+
+    def __init__(self, hidden_size: int, intermediate_size: int, dtype: torch.dtype):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.dtype = dtype
+        self.loaded = False
+
+    def forward(self, _x):
+        raise RuntimeError("lazy expert placeholder executed before materialization")
+
+
 class ChronosMOEFeedForward(nn.Module):
     """
     Extends MOEFeedForward with:
@@ -143,10 +162,12 @@ class ChronosMOEFeedForward(nn.Module):
                 self.aux_loss = scores.new_zeros(())
 
         else:
-            # --- Inference path: compile-safe soft gating ---
-            # Convert bool mask to float [num_experts] so all branching is
-            # expressed as multiplication — no Python-level if/else per expert,
-            # giving torch.compile a single traceable graph.
+            # --- Inference path: real lazy experts + shared fallback ---
+            # We intentionally branch at the Python level here: when an
+            # expert is cold we must not execute it at all, because the
+            # live module may have been replaced by a placeholder after
+            # expert offload. A multiply-by-zero path would still call the
+            # unloaded expert and defeat lazy loading entirely.
             avail = available_expert_mask.to(dtype=x_flat.dtype, device=x_flat.device)  # [E]
             shared_out_full = self._shared_expert_output(x_flat)  # [N, H] — computed once
 
@@ -156,13 +177,11 @@ class ChronosMOEFeedForward(nn.Module):
                     continue
                 token_idx = mask.any(dim=-1).nonzero().flatten()   # [T]
                 weight = topk_weight[mask].view(-1, 1)             # [T, 1]
-
-                expert_out   = expert(x_flat[token_idx])           # [T, H]
                 fallback_out = shared_out_full[token_idx]          # [T, H]
-
-                # avail[i] == 1.0 → expert output; 0.0 → shared fallback
-                # Single mul+add, no control flow visible to the compiler
-                blended = avail[i] * expert_out + (1.0 - avail[i]) * fallback_out
+                if float(avail[i].item()) > 0.0:
+                    blended = expert(x_flat[token_idx])            # [T, H]
+                else:
+                    blended = fallback_out
                 y.index_add_(0, token_idx, (blended * weight).to(y.dtype))
 
             self.aux_loss = scores.new_zeros(1).squeeze()

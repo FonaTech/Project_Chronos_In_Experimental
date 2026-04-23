@@ -11,7 +11,9 @@ import sys
 
 import gradio as gr
 
+from chronos.backend import training_available, resolve_training_device
 from ui.i18n import t, register_translatable
+from ui.tabs.train_tab import _distill_teacher_placeholder
 
 
 def _repo_root() -> str:
@@ -32,6 +34,8 @@ STAGES = [
     ("Distill",  "train_chronos_distill.py", "grpo",   "tests/fixtures/tiny_sft.jsonl",      True),
 ]
 
+PIPELINE_TRAIN_BACKEND_CHOICES = ["auto"] + [name for name in ("cuda", "xpu", "mps", "cpu") if name in set(training_available())]
+
 
 def build_pipeline_tab():
     with gr.Tab(t("tab.pipeline")) as tab:
@@ -41,8 +45,15 @@ def build_pipeline_tab():
         with gr.Row():
             save_dir = gr.Textbox(value="out", label=t("pipeline.save_dir"), scale=2)
             steps    = gr.Number(value=30, precision=0, label=t("pipeline.steps"), scale=1)
+            train_backend = gr.Dropdown(
+                choices=PIPELINE_TRAIN_BACKEND_CHOICES,
+                value="auto",
+                label=t("train.backend"),
+                scale=1,
+            )
             register_translatable(save_dir, "pipeline.save_dir")
             register_translatable(steps,    "pipeline.steps")
+            register_translatable(train_backend, "train.backend")
 
         # Per-stage rows: name + data_path + (optional) teacher_path + Run button
         per_stage_rows = []  # list of dicts {data, teacher_or_None, status, run_btn}
@@ -55,7 +66,7 @@ def build_pipeline_tab():
                 data_box = gr.Textbox(value=default_data, label=f"{name} {t('pipeline.data_path')}", scale=3)
                 teacher_box = (
                     gr.Textbox(value="", label=f"{name} {t('pipeline.teacher_path')}",
-                               placeholder=os.path.join("out", "sft_<H>_moe.pth"), scale=2)
+                               placeholder=_distill_teacher_placeholder(), scale=2)
                     if takes_teacher else None
                 )
                 status_box = gr.Textbox(value="pending", label=t("pipeline.status"), interactive=False, scale=1)
@@ -76,11 +87,13 @@ def build_pipeline_tab():
             name = row["name"]; script = row["script"]; from_w = row["from_weight"]
             takes_teacher = row["takes_teacher"]
 
-            def run(_save_dir, _steps, _data, _teacher, current_log):
+            def run(_save_dir, _steps, _backend, _data, _teacher, current_log):
+                _, resolved_device = resolve_training_device(_backend)
                 cmd = [sys.executable, script,    # relative — resolved against cwd
                        "--data_path", _data,
                        "--save_dir", _save_dir,
-                       "--steps", str(int(_steps))]
+                       "--steps", str(int(_steps)),
+                       "--device", resolved_device]
                 if from_w:
                     cmd += ["--from_weight", from_w]
                 if takes_teacher:
@@ -109,7 +122,7 @@ def build_pipeline_tab():
             return run
 
         for i, row in enumerate(per_stage_rows):
-            inputs = [save_dir, steps, row["data"]]
+            inputs = [save_dir, steps, train_backend, row["data"]]
             inputs.append(row["teacher"] if row["takes_teacher"] else gr.State(""))
             inputs.append(log_box)
             row["run_btn"].click(
