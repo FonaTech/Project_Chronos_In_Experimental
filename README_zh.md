@@ -20,20 +20,31 @@
 
 ## Chronos 的核心思路：把 IO 挪到 Prefill，把同步挪到事件级
 
-```
-传统 MoE 解码循环：                    Chronos 解码循环：
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Prompt as Prompt tokens
+    participant Intent as IntentClassifier
+    participant SSD as 聚簇 SSD 缓存
+    participant RAM as Pinned RAM
+    participant H2D as H2D stream
+    participant GPU as Decode compute stream
+    participant LR as LookaheadRouter
 
-  Token t                              Prefill（一次性）：
-    → 路由 → 需要哪个专家？                读取完整 Prompt
-    → 专家在 VRAM？不在                    IntentClassifier → 预测专家集合
-    → [阻塞：SSD→RAM→VRAM，~40ms]          AsyncLoad: SSD→RAM→VRAM（后台）
-    → 计算                                 等待加载完毕
-    → Token t+1（重复）
-                                       Token t（之后每个 token）：
-                                         Prefetch(t+1 expert) ──► (H2D 流)
-  每个 token 都在等 IO。                  forward(t)             (compute 流，并行)
-                                         wait_for_event(t+1 only)
-                                         [无阻塞，无全局 sync]
+    rect rgb(236, 248, 255)
+        Prompt->>Intent: prefill 读取完整 prompt
+        Intent->>SSD: 预测整次生成的热点专家集合
+        SSD->>RAM: mmap cluster-packed .ctsr 文件
+        RAM->>H2D: 首个 decode token 前排队加载热点专家
+        H2D-->>GPU: per-expert ready event
+    end
+
+    loop 每个 decode token
+        GPU->>LR: Block 0 hidden state
+        LR->>H2D: 预取 t+1..t+K 的未来专家
+        GPU->>GPU: 使用已驻留专家计算 token t
+        GPU->>H2D: 只等待当前所需专家事件
+    end
 ```
 
 两层关键改进：
@@ -45,26 +56,35 @@
 
 ## 三级存储架构（M1：cluster-aware safetensors）
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        VRAM / Metal 统一内存                            │
-│  ┌─────────────────┐  ┌──────────────────────────────────────────────┐  │
-│  │  Dense 第一层   │  │  共享专家（常驻）                            │  │
-│  │  (IntentCLF)    │  │  + 预测热门专家（预加载完毕）                │  │
-│  └─────────────────┘  └──────────────────────────────────────────────┘  │
-└──────────────────────────────────┬──────────────────────────────────────┘
-                                   │  H2D：独立 CUDA Stream + per-expert Event
-┌──────────────────────────────────▼──────────────────────────────────────┐
-│                         Pinned RAM 缓冲区                               │
-│         已预取的专家权重（safetensors mmap，页锁定内存）                │
-│         AsyncPrefetcher 后台线程从 SSD 读入此处                         │
-└──────────────────────────────────┬──────────────────────────────────────┘
-                                   │  按 cluster 顺序读（一次 mmap N 个专家）
-┌──────────────────────────────────▼──────────────────────────────────────┐
-│                              NVMe SSD                                   │
-│   一个 .ctsr 文件 = 一个 Louvain 聚簇（共激活专家打包，连续物理布局）   │
-│   配套 cluster_manifest.json 描述 expert→cluster 映射                   │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph GPU["VRAM / Metal 统一内存"]
+        Dense["Dense layers"]
+        Shared["共享专家<br/>始终驻留"]
+        Hot["预测热点专家<br/>使用前提升到 VRAM"]
+        Events["per-expert CUDA event<br/>无全局 stream sync"]
+    end
+
+    subgraph RAM["Pinned RAM 中转层"]
+        Buffer["已预取专家权重"]
+        LRU["RAM LRU cache"]
+    end
+
+    subgraph Disk["NVMe SSD"]
+        C1["cluster_000.ctsr"]
+        C2["cluster_001.ctsr"]
+        Manifest["cluster_manifest.json<br/>expert -> cluster 映射"]
+    end
+
+    Manifest --> C1
+    Manifest --> C2
+    C1 -->|"顺序 mmap 读取"| Buffer
+    C2 -->|"顺序 mmap 读取"| Buffer
+    Buffer --> LRU
+    LRU -->|"非阻塞 H2D"| Hot
+    Hot --> Events
+    Shared --> Events
+    Dense --> Events
 ```
 
 `cluster_manifest.json` 与 `.ctsr` 文件由离线 Louvain 聚类生成；运行时一次 `safetensors.safe_open(...).mmap` 把整个簇拉进 RAM，把随机读改写成顺序读。
@@ -84,6 +104,22 @@ output = avail[i] * expert_output + (1.0 - avail[i]) * shared_expert_output
 
 ## 双层路由 + 监督的 Lookahead（M2）
 
+```mermaid
+flowchart LR
+    Prompt["Prompt / prefill context"] --> IC["IntentClassifier<br/>整次生成专家先验"]
+    IC --> Budget["ExpertPredictor<br/>带预算的热点专家集合"]
+    Budget --> Prefill["PrefillScheduler<br/>decode 前批量预加载"]
+
+    Token["Decode token t"] --> Block0["Transformer Block 0"]
+    Block0 --> LR["LookaheadRouter<br/>Q_t^(1..K)"]
+    LR --> Future["未来专家预测<br/>t+1 ... t+K"]
+    Future --> Async["AsyncPrefetcher<br/>预取队列"]
+
+    Prefill --> Cache["CacheManager / ExpertStore"]
+    Async --> Cache
+    Cache --> MoE["ChronosMOEFeedForward<br/>驻留专家或共享专家兜底"]
+```
+
 | | IntentClassifier（第一层） | LookaheadRouter（第二层） |
 |---|---|---|
 | **触发时机** | Prefill 阶段一次 | Decode 每个 token |
@@ -94,9 +130,17 @@ output = avail[i] * expert_output + (1.0 - avail[i]) * shared_expert_output
 
 M2 之前 LookaheadRouter 没有任何监督——只是个未训练的 head。M2 引入：
 
-```
-L_lookahead = (1/K) · Σ_{k=1..K} CE( stopgrad(real_router_{t+k}), lookahead_pred_t^{(k)} )
-```
+$$
+\mathcal{L}_{\text{lookahead}}
+= \frac{1}{|\mathcal{K}_{\text{valid}}|}
+\sum_{k \in \mathcal{K}_{\text{valid}}}
+\mathbb{E}_{b,t}
+\left[
+  - \sum_{e=1}^{E}
+  \operatorname{stopgrad}\!\left(P_{b,t+k,e}\right)
+  \log Q_{b,t,e}^{(k)}
+\right].
+$$
 
 让前瞻头真正学习预测未来 K 步的路由分布。
 
@@ -105,6 +149,29 @@ L_lookahead = (1/K) · Σ_{k=1..K} CE( stopgrad(real_router_{t+k}), lookahead_pr
 ## 完整训练链路（Stage 1 → Stage 6）
 
 每个阶段都是独立的 entry script，**全部继承 Chronos 损失混合器**（lookahead + temporal + balance），并在对齐阶段引入**路由 KL 锚定**防止缓存命中率被 RL/DPO 梯度毁掉。
+
+```mermaid
+flowchart LR
+    P1["Stage 1<br/>Pretrain<br/>CE + Chronos mix"] --> P2["Stage 2<br/>SFT<br/>assistant-token CE + mix"]
+    P2 --> P3["Stage 3<br/>DPO<br/>preference loss + anchor"]
+    P2 --> P4["Stage 4<br/>ORPO<br/>NLL + odds-ratio + anchor"]
+    P4 --> P5["Stage 5<br/>GRPO<br/>rollout reward + KL + anchor"]
+    P5 --> P6["Stage 6<br/>Distill<br/>KD + CE + anchor"]
+
+    subgraph Shared["共享 Chronos 训练项"]
+        B["raw load-balance aux"]
+        T["temporal locality"]
+        LA["supervised lookahead"]
+        A["router KL anchor<br/>对齐阶段"]
+    end
+
+    Shared -. 应用于 .-> P1
+    Shared -. 应用于 .-> P2
+    Shared -. 应用于 .-> P3
+    Shared -. 应用于 .-> P4
+    Shared -. 应用于 .-> P5
+    Shared -. 应用于 .-> P6
+```
 
 | Stage | 脚本 | 核心损失 | Router KL 锚定 (默认 λ) |
 |---|---|---|---|
@@ -120,6 +187,19 @@ L_lookahead = (1/K) · Σ_{k=1..K} CE( stopgrad(real_router_{t+k}), lookahead_pr
 ---
 
 ## 多后端调度（M5）
+
+```mermaid
+flowchart TD
+    Request["用户请求<br/>训练 / 推理 / WebUI / CLI"] --> Dispatcher["BackendDispatcher"]
+    Dispatcher --> Probe["能力探针"]
+    Probe --> CUDA["CUDA<br/>训练 + 推理"]
+    Probe --> MPS["MPS<br/>训练 + 推理"]
+    Probe --> MLX["MLX<br/>Apple Silicon 原生路径"]
+    Probe --> CPU["CPU<br/>可移植 fallback"]
+    Probe --> EXT["扩展钩子<br/>Vulkan / OpenCL"]
+    Dispatcher --> Choice["优先级 + 可用性决策"]
+    Choice --> Runtime["Chronos runtime / trainer"]
+```
 
 ```python
 from chronos.backend import BackendDispatcher
@@ -174,13 +254,45 @@ d.describe()       # 人类可读的能力总览
 ## 损失函数（完整形式）
 
 $$
-L_{\text{total}} = L_{\text{base}} + \lambda_{\text{bal}} L_{\text{balance}} + \lambda_{\text{tmp}} L_{\text{temporal}} + \lambda_{\text{LA}} L_{\text{lookahead}} + \lambda_{\text{anc}} L_{\text{router-KL-anchor}}
+\begin{aligned}
+\mathcal{L}_{\text{total}}
+&= \mathcal{L}_{\text{base}}
+ + \lambda_{\text{bal}} \mathcal{L}_{\text{aux-raw}}
+ + \lambda_{\text{tmp}} \mathcal{L}_{\text{temporal}} \\
+&\quad
+ + \lambda_{\text{LA}} \mathcal{L}_{\text{lookahead}}
+ + \lambda_{\text{anc}} \mathcal{L}_{\text{router-KL-anchor}} .
+\end{aligned}
 $$
 
-- $L_{\text{base}}$：阶段相关（CE / DPO / ORPO / GRPO / KD）
-- $L_{\text{temporal}} = \frac{1}{T} \sum_{t=2}^{T} \| E_t - E_{t-1} \|_2^2$ — 鼓励相邻 token 复用同一批专家
-- $L_{\text{lookahead}} = \frac{1}{K} \sum_{k=1}^{K} \mathrm{CE}\big(\text{stopgrad}(P_{t+k}),\ Q_t^{(k)}\big)$ — 监督前瞻头
-- $L_{\text{router-KL-anchor}} = \mathrm{KL}\big(\pi_\theta^{\text{router}} \,\|\, \pi_{\text{pretrain}}^{\text{router}}\big)$ — 防止对齐阶段毁掉聚簇布局
+$$
+\mathcal{L}_{\text{aux-raw}}
+= E \sum_{e=1}^{E} \operatorname{load}_e \cdot \overline{p}_e
+$$
+
+$$
+\mathcal{L}_{\text{temporal}}
+= \mathbb{E}_{b,t}
+\left[
+  \left\| P_{b,t,:} - P_{b,t-1,:} \right\|_2^2
+\right]
+$$
+
+$$
+\mathcal{L}_{\text{router-KL-anchor}}
+= D_{\mathrm{KL}}
+\left(
+  \pi_{\theta}^{\text{router}}
+  \,\middle\|\,
+  \pi_{\text{ref}}^{\text{router}}
+\right)
+$$
+
+- $\mathcal{L}_{\text{base}}$：阶段相关目标（CE / DPO / ORPO / GRPO / KD）。
+- $\mathcal{L}_{\text{aux-raw}}$：未缩放的 MoE load-balance 辅助项；Chronos 在 `chronos_loss_term` 中只乘一次 $\lambda_{\text{bal}}$。
+- $\mathcal{L}_{\text{temporal}}$：约束相邻 token 的路由分布不要剧烈跳变，提高专家复用和缓存局部性。
+- $\mathcal{L}_{\text{lookahead}}$：未来真实路由分布到前瞻预测的 soft-target cross entropy。
+- $\mathcal{L}_{\text{router-KL-anchor}}$：对齐阶段锚定 stage 开始时捕获的参考路由分布，防止 RL/DPO/ORPO/GRPO 梯度破坏聚簇布局。
 
 `λ` 全部支持 Optuna TPE 自动搜索（包括 `hidden_size` / `num_experts` / `kv_latent_dim` 等结构超参）。
 
@@ -195,8 +307,8 @@ pip install project-chronos
 或从源码：
 
 ```bash
-git clone https://github.com/your-org/project-chronos
-cd project-chronos
+git clone https://github.com/FonaTech/Project_Chronos
+cd Project_Chronos
 pip install -e ".[dev]"
 ```
 
@@ -214,7 +326,7 @@ pip install vllm
 > 若本地未找到，首次 import 时自动克隆至 `~/.cache/chronos/minimind-master/`。
 > minimind 采用 **Apache-2.0** 授权，完整归属见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-**环境要求**：Python 3.10+，PyTorch 2.1+
+**环境要求**：Python 3.10+，PyTorch 2.4+
 
 ---
 
@@ -395,17 +507,84 @@ Project_Chronos/
 
 ## 开发路线图
 
-- [x] Phase 1: LookaheadRouter + 时间局部性损失
-- [x] Phase 2: 异步 IO 引擎 + 三级存储 + 共现聚簇布局
-- [x] Phase 3: 混合注意力（MLA + SlidingWindow）+ PrefillScheduler + 双层路由
-- [x] Phase 4: MLX 原生后端、Web UI、CLI、Optuna λ 搜索、开源发布
-- [x] **M1**: cluster-aware safetensors 三级存储（替换 .pt pickle）
-- [x] **M2**: 真实 lookahead 监督损失（`L_lookahead`）
-- [x] **M3**: 双流解码流水线（per-expert event，非阻塞 H2D）
-- [x] **M4**: 完整 SFT / DPO / ORPO / GRPO 训练器 + 路由 KL 锚定
-- [x] **M5**: HF safetensors I/O + AutoModel 注册 + vLLM adapter + 多后端调度 + Stage 6 蒸馏 + 可插 reward 模型
-- [x] **M6**: WebUI v2（合并 Config+Designer、6 阶段独立数据路径、autotune 持久化 & Apply Best、Benchmark BarPlot、IO Monitor）
-- [ ] Phase 5（待办）: 大规模激活语料上训练 IntentClassifier；7B+ 规模基准；vLLM worker 端 mask 注入；Vulkan/OpenCL 实际 kernel
+```mermaid
+timeline
+    title Project Chronos 交付路线
+    Phase 1
+        : LookaheadRouter
+        : 时间局部性正则
+        : 路由概率采集路径
+    Phase 2
+        : 异步 IO 引擎
+        : SSD / RAM / VRAM 三级存储
+        : 共激活专家聚簇
+    Phase 3
+        : Hybrid MLA + SlidingWindow attention
+        : PrefillScheduler
+        : 双层路由
+    Phase 4
+        : MLX 原生后端
+        : Web UI 和 CLI
+        : Optuna 搜索
+        : 开源发布
+    M1-M3
+        : cluster-aware safetensors 存储
+        : 真实监督 lookahead loss
+        : per-expert event 双流解码
+    M4-M6
+        : SFT / DPO / ORPO / GRPO 训练器
+        : Router KL anchor
+        : HF IO、vLLM adapter、多后端调度
+        : Stage 6 蒸馏和可插拔 reward
+        : Web UI v2、Benchmark 图表、IO Monitor
+    Next
+        : 大规模激活语料训练 IntentClassifier
+        : 7B+ checkpoint 基准测试
+        : vLLM worker path mask 注入
+        : 真正的 Vulkan / OpenCL kernel
+```
+
+```mermaid
+mindmap
+  root((Chronos 架构创新面))
+    预测式路由
+      IntentClassifier
+        Prompt 级热点专家先验
+        带预算的专家集合预测
+      LookaheadRouter
+        每 token 未来路由预测
+        真实未来路由 soft-target CE
+    存储感知 MoE
+      Clustered safetensors
+        .ctsr 专家聚簇打包
+        manifest 驱动 mmap
+      三级缓存
+        NVMe SSD
+        Pinned RAM
+        VRAM / 统一内存
+      柔性兜底
+        共享专家始终驻留
+        cache miss 不硬阻塞
+    Decode 流水线
+      Prefill-time expert loading
+      AsyncPrefetcher 队列
+      H2D stream
+      per-expert CUDA event
+    训练栈
+      Pretrain
+      SFT
+      DPO
+      ORPO
+      GRPO
+      Distill
+      Router KL anchor
+    部署
+      HF safetensors IO
+      AutoModel 注册
+      vLLM adapter
+      CPU / CUDA / MPS / MLX 调度
+      Web UI 和 CLI
+```
 
 ---
 
@@ -417,7 +596,7 @@ Project_Chronos/
              for Zero-Stall On-Device MoE Inference},
   author = {Fona and Project Chronos Contributors},
   year   = {2026},
-  url    = {[project-chronos](https://github.com/FonaTech/Project_Chronos_In_Experimental)}
+  url    = {https://github.com/FonaTech/Project_Chronos}
 }
 ```
 

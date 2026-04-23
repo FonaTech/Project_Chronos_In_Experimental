@@ -24,21 +24,31 @@ Most offload runtimes assume the model was originally designed for full VRAM res
 
 **Move IO into prefill. Move synchronization down to the expert-event level.**
 
-```text
-Conventional MoE decode loop:             Chronos decode loop:
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Prompt as Prompt tokens
+    participant Intent as IntentClassifier
+    participant SSD as Clustered SSD cache
+    participant RAM as Pinned RAM
+    participant H2D as H2D stream
+    participant GPU as Decode compute stream
+    participant LR as LookaheadRouter
 
-  Token t                                 Prefill (once):
-    -> route -> which expert?               Read the full prompt
-    -> expert in VRAM? no                   IntentClassifier -> predict expert set
-    -> [STALL: SSD->RAM->VRAM, ~40ms]       AsyncLoad: SSD->RAM->VRAM (background)
-    -> compute                              Wait until those experts are ready
-    -> token t+1
+    rect rgb(236, 248, 255)
+        Prompt->>Intent: prefill reads the whole prompt
+        Intent->>SSD: predict generation-level expert set
+        SSD->>RAM: mmap cluster-packed .ctsr files
+        RAM->>H2D: enqueue hot experts before first decode token
+        H2D-->>GPU: per-expert ready events
+    end
 
-  Every token pays the IO tax.            Token t (every token after):
-                                            Prefetch(t+1 expert) -> H2D stream
-                                            forward(t)            compute stream
-                                            wait_for_event(t+1 only)
-                                            [no global sync]
+    loop every decode token
+        GPU->>LR: block-0 hidden state
+        LR->>H2D: prefetch experts for t+1..t+K
+        GPU->>GPU: forward token t with resident experts
+        GPU->>H2D: wait only on the expert events it needs
+    end
 ```
 
 Two things matter here:
@@ -52,26 +62,35 @@ Under a simulated 30 ms SSD delay, the new path keeps **35 ms+ per token** of pi
 
 ## Three-tier storage (M1: cluster-aware safetensors)
 
-```text
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        VRAM / Metal unified memory                     │
-│  ┌─────────────────┐  ┌──────────────────────────────────────────────┐ │
-│  │  Dense layer 1  │  │  Shared experts (always resident)           │ │
-│  │  (IntentCLF)    │  │  + predicted hot experts (preloaded)        │ │
-│  └─────────────────┘  └──────────────────────────────────────────────┘ │
-└──────────────────────────────────┬──────────────────────────────────────┘
-                                   │  H2D: dedicated CUDA stream + per-expert event
-┌──────────────────────────────────▼──────────────────────────────────────┐
-│                         Pinned RAM buffer                              │
-│         Prefetched expert weights (safetensors mmap, page-locked)     │
-│         AsyncPrefetcher pulls data here from SSD in the background    │
-└──────────────────────────────────┬──────────────────────────────────────┘
-                                   │  Read by cluster order
-┌──────────────────────────────────▼──────────────────────────────────────┐
-│                              NVMe SSD                                  │
-│   One .ctsr file = one Louvain cluster of co-activated experts        │
-│   cluster_manifest.json stores the expert -> cluster mapping          │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph GPU["VRAM / Metal unified memory"]
+        Dense["Dense layers"]
+        Shared["Shared experts<br/>always resident"]
+        Hot["Predicted hot experts<br/>promoted before use"]
+        Events["Per-expert CUDA events<br/>no global stream sync"]
+    end
+
+    subgraph RAM["Pinned RAM staging tier"]
+        Buffer["Prefetched expert tensors"]
+        LRU["RAM LRU cache"]
+    end
+
+    subgraph Disk["NVMe SSD"]
+        C1["cluster_000.ctsr"]
+        C2["cluster_001.ctsr"]
+        Manifest["cluster_manifest.json<br/>expert -> cluster map"]
+    end
+
+    Manifest --> C1
+    Manifest --> C2
+    C1 -->|"sequential mmap read"| Buffer
+    C2 -->|"sequential mmap read"| Buffer
+    Buffer --> LRU
+    LRU -->|"non-blocking H2D"| Hot
+    Hot --> Events
+    Shared --> Events
+    Dense --> Events
 ```
 
 `cluster_manifest.json` and `.ctsr` files are produced offline by Louvain clustering. At runtime, Chronos uses `safetensors.safe_open(...).mmap` to bring an entire expert cluster into RAM in one shot, turning random reads into mostly sequential reads.
@@ -91,6 +110,22 @@ The shared expert is always resident, so generation continues while the missing 
 
 ## Dual-layer routing with supervised lookahead (M2)
 
+```mermaid
+flowchart LR
+    Prompt["Prompt / prefill context"] --> IC["IntentClassifier<br/>generation-level expert prior"]
+    IC --> Budget["ExpertPredictor<br/>budgeted hot set"]
+    Budget --> Prefill["PrefillScheduler<br/>bulk preload before decode"]
+
+    Token["Decode token t"] --> Block0["Transformer block 0"]
+    Block0 --> LR["LookaheadRouter<br/>Q_t^(1..K)"]
+    LR --> Future["Future expert predictions<br/>t+1 ... t+K"]
+    Future --> Async["AsyncPrefetcher<br/>prefetch queue"]
+
+    Prefill --> Cache["CacheManager / ExpertStore"]
+    Async --> Cache
+    Cache --> MoE["ChronosMOEFeedForward<br/>resident expert or shared fallback"]
+```
+
 | | IntentClassifier (Layer 1) | LookaheadRouter (Layer 2) |
 |---|---|---|
 | **When it runs** | Once during prefill | Every token during decode |
@@ -99,11 +134,19 @@ The shared expert is always resident, so generation continues while the missing 
 | **Training target** | Supervised from real activation logs | **`L_lookahead` supervised by real router decisions at t+k** |
 | **Parameter count** | ~10-15M | ~2M |
 
-Before M2, the lookahead head was just a head with no real supervision. M2 adds a proper objective:
+Before M2, the lookahead head was just a head with no real supervision. M2 adds a proper soft-target objective:
 
-```text
-L_lookahead = (1 / K) * sum_{k=1..K} CE(stopgrad(real_router_{t+k}), lookahead_pred_t^(k))
-```
+$$
+\mathcal{L}_{\text{lookahead}}
+= \frac{1}{|\mathcal{K}_{\text{valid}}|}
+\sum_{k \in \mathcal{K}_{\text{valid}}}
+\mathbb{E}_{b,t}
+\left[
+  - \sum_{e=1}^{E}
+  \operatorname{stopgrad}\!\left(P_{b,t+k,e}\right)
+  \log Q_{b,t,e}^{(k)}
+\right].
+$$
 
 That turns the lookahead router into an actual predictor of future routing, instead of a best-effort heuristic.
 
@@ -112,6 +155,29 @@ That turns the lookahead router into an actual predictor of future routing, inst
 ## Full training stack: Stage 1 -> Stage 6
 
 Each stage has its own entry script, and every one of them inherits the shared Chronos loss mixer: balance loss, temporal locality loss, lookahead loss, and, for alignment stages, a router KL anchor that keeps RL/DPO updates from destroying cache locality.
+
+```mermaid
+flowchart LR
+    P1["Stage 1<br/>Pretrain<br/>CE + Chronos mix"] --> P2["Stage 2<br/>SFT<br/>assistant-token CE + mix"]
+    P2 --> P3["Stage 3<br/>DPO<br/>preference loss + anchor"]
+    P2 --> P4["Stage 4<br/>ORPO<br/>NLL + odds-ratio + anchor"]
+    P4 --> P5["Stage 5<br/>GRPO<br/>rollout reward + KL + anchor"]
+    P5 --> P6["Stage 6<br/>Distill<br/>KD + CE + anchor"]
+
+    subgraph Shared["Shared Chronos training terms"]
+        B["raw load-balance aux"]
+        T["temporal locality"]
+        LA["supervised lookahead"]
+        A["router KL anchor<br/>alignment stages"]
+    end
+
+    Shared -. applied to .-> P1
+    Shared -. applied to .-> P2
+    Shared -. applied to .-> P3
+    Shared -. applied to .-> P4
+    Shared -. applied to .-> P5
+    Shared -. applied to .-> P6
+```
 
 | Stage | Script | Core objective | Router KL anchor (default lambda) |
 |---|---|---|---|
@@ -127,6 +193,19 @@ The full six-stage comparison harness lives in `tools/compare_minimind_chronos_v
 ---
 
 ## Backend dispatch (M5)
+
+```mermaid
+flowchart TD
+    Request["User request<br/>train / inference / WebUI / CLI"] --> Dispatcher["BackendDispatcher"]
+    Dispatcher --> Probe["Capability probes"]
+    Probe --> CUDA["CUDA<br/>training + inference"]
+    Probe --> MPS["MPS<br/>training + inference"]
+    Probe --> MLX["MLX<br/>Apple Silicon native path"]
+    Probe --> CPU["CPU<br/>portable fallback"]
+    Probe --> EXT["Extension hooks<br/>Vulkan / OpenCL"]
+    Dispatcher --> Choice["Priority + availability decision"]
+    Choice --> Runtime["Chronos runtime / trainer"]
+```
 
 ```python
 from chronos.backend import BackendDispatcher
@@ -182,18 +261,46 @@ Honest note: upstream PyTorch does not ship a real OpenCL backend, and Vulkan su
 
 ## Objective
 
-```text
-L_total = L_base
-        + lambda_bal * L_balance
-        + lambda_tmp * L_temporal
-        + lambda_LA  * L_lookahead
-        + lambda_anc * L_router_KL_anchor
-```
+$$
+\begin{aligned}
+\mathcal{L}_{\text{total}}
+&= \mathcal{L}_{\text{base}}
+ + \lambda_{\text{bal}} \mathcal{L}_{\text{aux-raw}}
+ + \lambda_{\text{tmp}} \mathcal{L}_{\text{temporal}} \\
+&\quad
+ + \lambda_{\text{LA}} \mathcal{L}_{\text{lookahead}}
+ + \lambda_{\text{anc}} \mathcal{L}_{\text{router-KL-anchor}} .
+\end{aligned}
+$$
 
-- `L_base`: stage-specific objective (`CE`, `DPO`, `ORPO`, `GRPO`, or distillation)
-- `L_temporal = (1 / T) * sum_{t=2..T} ||E_t - E_{t-1}||_2^2`: encourages adjacent tokens to reuse similar experts
-- `L_lookahead = (1 / K) * sum_{k=1..K} CE(stopgrad(P_{t+k}), Q_t^(k))`: supervises the lookahead head
-- `L_router_KL_anchor = KL(pi_theta^router || pi_pretrain^router)`: keeps alignment-stage updates from destroying the routing layout learned during pretraining
+$$
+\mathcal{L}_{\text{aux-raw}}
+= E \sum_{e=1}^{E} \operatorname{load}_e \cdot \overline{p}_e
+$$
+
+$$
+\mathcal{L}_{\text{temporal}}
+= \mathbb{E}_{b,t}
+\left[
+  \left\| P_{b,t,:} - P_{b,t-1,:} \right\|_2^2
+\right]
+$$
+
+$$
+\mathcal{L}_{\text{router-KL-anchor}}
+= D_{\mathrm{KL}}
+\left(
+  \pi_{\theta}^{\text{router}}
+  \,\middle\|\,
+  \pi_{\text{ref}}^{\text{router}}
+\right)
+$$
+
+- $\mathcal{L}_{\text{base}}$: stage-specific objective (`CE`, `DPO`, `ORPO`, `GRPO`, or distillation).
+- $\mathcal{L}_{\text{aux-raw}}$: the unscaled MoE load-balance auxiliary term; Chronos applies $\lambda_{\text{bal}}$ once in `chronos_loss_term`.
+- $\mathcal{L}_{\text{temporal}}$: encourages adjacent tokens to reuse similar expert distributions.
+- $\mathcal{L}_{\text{lookahead}}$: soft-target cross entropy from the real future router distribution to the lookahead prediction.
+- $\mathcal{L}_{\text{router-KL-anchor}}$: keeps alignment-stage updates from destroying the routing layout captured at stage start.
 
 All lambda terms are searchable with Optuna TPE, together with structural hyperparameters such as `hidden_size`, `num_experts`, and `kv_latent_dim`.
 
@@ -208,8 +315,8 @@ pip install project-chronos
 Or from source:
 
 ```bash
-git clone https://github.com/your-org/project-chronos
-cd project-chronos
+git clone https://github.com/FonaTech/Project_Chronos
+cd Project_Chronos
 pip install -e ".[dev]"
 ```
 
@@ -229,7 +336,7 @@ pip install vllm
 > If it is not found locally, Chronos clones it automatically into `~/.cache/chronos/minimind-master/` on first import.
 > minimind is licensed under **Apache-2.0**. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution details.
 
-**Requirements**: Python 3.10+, PyTorch 2.1+
+**Requirements**: Python 3.10+, PyTorch 2.4+
 
 ---
 
@@ -427,17 +534,84 @@ Project_Chronos/
 
 ## Roadmap
 
-- [x] Phase 1: LookaheadRouter + temporal locality loss
-- [x] Phase 2: Async IO engine + three-tier storage + co-occurrence clustering
-- [x] Phase 3: Hybrid attention (MLA + SlidingWindow) + PrefillScheduler + dual-layer routing
-- [x] Phase 4: Native MLX backend, Web UI, CLI, Optuna search, open-source release
-- [x] M1: cluster-aware safetensors storage
-- [x] M2: supervised lookahead loss (`L_lookahead`)
-- [x] M3: dual-stream decode pipeline with per-expert events
-- [x] M4: full SFT / DPO / ORPO / GRPO trainers + router KL anchor
-- [x] M5: HF safetensors IO + AutoModel registration + vLLM adapter + multi-backend dispatch + Stage 6 distillation + pluggable reward model
-- [x] M6: Web UI v2 (merged Config + Designer, per-stage datasets, persistent autotune log, Apply Best, benchmark bar plot, IO Monitor)
-- [ ] Phase 5: Train `IntentClassifier` on large activation corpora, benchmark 7B+ models, inject masks on the vLLM worker path, and ship real Vulkan / OpenCL kernels
+```mermaid
+timeline
+    title Project Chronos delivery map
+    Phase 1
+        : LookaheadRouter
+        : Temporal locality regularization
+        : Router-probability collection path
+    Phase 2
+        : Async IO engine
+        : Three-tier SSD/RAM/VRAM storage
+        : Co-activation clustering
+    Phase 3
+        : Hybrid MLA + SlidingWindow attention
+        : PrefillScheduler
+        : Dual-layer routing
+    Phase 4
+        : Native MLX backend
+        : Web UI and CLI
+        : Optuna search
+        : Open-source release
+    M1-M3
+        : Cluster-aware safetensors storage
+        : Supervised lookahead loss
+        : Dual-stream decode with per-expert events
+    M4-M6
+        : SFT / DPO / ORPO / GRPO trainers
+        : Router KL anchor
+        : HF IO, vLLM adapter, multi-backend dispatch
+        : Stage 6 distillation and pluggable rewards
+        : Web UI v2, benchmark plots, IO Monitor
+    Next
+        : Train IntentClassifier on large activation corpora
+        : Benchmark 7B+ checkpoints
+        : Inject masks on the vLLM worker path
+        : Ship real Vulkan / OpenCL kernels
+```
+
+```mermaid
+mindmap
+  root((Chronos innovation surface))
+    Predictive routing
+      IntentClassifier
+        Prompt-level hot expert prior
+        Budgeted expert-set prediction
+      LookaheadRouter
+        Per-token future routing
+        Soft-target CE from real future routers
+    Storage-aware MoE
+      Clustered safetensors
+        .ctsr packed expert clusters
+        manifest-driven mmap
+      Three-tier cache
+        NVMe SSD
+        Pinned RAM
+        VRAM / unified memory
+      Soft fallback
+        Shared experts always resident
+        No hard stall on cache miss
+    Decode pipeline
+      Prefill-time expert loading
+      AsyncPrefetcher queue
+      H2D stream
+      Per-expert CUDA events
+    Training stack
+      Pretrain
+      SFT
+      DPO
+      ORPO
+      GRPO
+      Distill
+      Router KL anchor
+    Deployment
+      HF safetensors IO
+      AutoModel registration
+      vLLM adapter
+      CPU / CUDA / MPS / MLX dispatch
+      Web UI and CLI
+```
 
 ---
 
@@ -449,7 +623,7 @@ Project_Chronos/
              for Zero-Stall On-Device MoE Inference},
   author = {Fona and Project Chronos Contributors},
   year   = {2026},
-  url    = {[project-chronos](https://github.com/FonaTech/Project_Chronos_In_Experimental)}
+  url    = {https://github.com/FonaTech/Project_Chronos}
 }
 ```
 
