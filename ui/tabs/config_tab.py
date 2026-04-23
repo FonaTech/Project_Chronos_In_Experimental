@@ -12,15 +12,13 @@ dataset choice. Only save_dir is shared model-wide.
 """
 from ui.gradio_compat import gr
 
-from chronos.model.config import ChronosConfig
 from ui.i18n import t, register_translatable
 from ui.estimator import (
     ArchConfig, total_params, active_params, memory_footprint,
     estimated_decode_tps, fmt_bytes, fmt_params,
 )
 from ui.presets import (
-    MINIMIND_MOE_DEFAULTS, PRESETS, preset_names, get_preset,
-    values_in_input_order, save_config, load_config, CONFIG_INPUT_ORDER,
+    preset_names, get_preset, values_in_input_order, save_config, load_config,
 )
 
 
@@ -88,7 +86,9 @@ def build_config_tab():
     data_path has been moved to the Train tab, so the tuple now has 3
     elements. Callers must be updated.
     """
-    config_state = gr.State(ChronosConfig().__dict__.copy())
+    initial_preset = "Recommended-CN (≈120M)"
+    initial_cfg = get_preset(initial_preset)
+    config_state = gr.State(dict(initial_cfg))
 
     with gr.Tab(t("tab.config")) as tab:
         register_translatable(tab, "tab.config")
@@ -97,7 +97,7 @@ def build_config_tab():
         with gr.Row():
             preset_dd = gr.Dropdown(
                 choices=preset_names(),
-                value="Recommended-CN (≈120M)",
+                value=initial_preset,
                 label=t("config.preset"),
                 scale=2,
             )
@@ -123,7 +123,7 @@ def build_config_tab():
             with gr.Column(scale=3):
                 gr.Markdown(f"### {t('config.arch')}")
 
-                D = MINIMIND_MOE_DEFAULTS  # MiniMind-MoE starting values
+                D = initial_cfg
 
                 with gr.Row():
                     hidden_size     = gr.Slider(*RANGES["hidden_size"],       value=D["hidden_size"],         label=t("config.hidden_size"))
@@ -211,7 +211,7 @@ def build_config_tab():
                     register_translatable(save_interval, "config.save_interval")
                     register_translatable(save_dir,      "config.save_dir")
 
-                config_display = gr.JSON(label="Current Config (saved to config_state)", value={})
+                config_display = gr.JSON(label="Current Config (saved to config_state)", value=initial_cfg)
 
             with gr.Column(scale=1, min_width=260):
                 gr.Markdown(f"### 🧬 {t('designer.title')}")
@@ -282,11 +282,11 @@ def build_config_tab():
         # ── Preset / Save / Load wiring ───────────────────────
         def apply_preset(name):
             cfg = get_preset(name)
-            return [gr.update(value=v) for v in values_in_input_order(cfg)]
+            return [dict(cfg), dict(cfg)] + [gr.update(value=v) for v in values_in_input_order(cfg)]
 
         def reset_minimind():
             cfg = get_preset("MiniMind-MoE (default)")
-            return [gr.update(value=v) for v in values_in_input_order(cfg)]
+            return [dict(cfg), dict(cfg)] + [gr.update(value=v) for v in values_in_input_order(cfg)]
 
         def do_save(cfg, path):
             try:
@@ -299,21 +299,20 @@ def build_config_tab():
             try:
                 cfg = load_config(path)
                 vals = values_in_input_order(cfg)
-                return [f"✅ Loaded from `{path}`"] + [gr.update(value=v) for v in vals]
+                return [f"✅ Loaded from `{path}`", dict(cfg), dict(cfg)] + [gr.update(value=v) for v in vals]
             except FileNotFoundError:
-                return [f"❌ Not found: `{path}`"] + [gr.update() for _ in all_inputs]
+                return [f"❌ Not found: `{path}`", gr.update(), gr.update()] + [gr.update() for _ in all_inputs]
             except Exception as e:
-                return [f"❌ Load failed: {e}"] + [gr.update() for _ in all_inputs]
+                return [f"❌ Load failed: {e}", gr.update(), gr.update()] + [gr.update() for _ in all_inputs]
 
-        apply_preset_btn.click(fn=apply_preset, inputs=[preset_dd], outputs=all_inputs)
+        apply_preset_btn.click(fn=apply_preset, inputs=[preset_dd], outputs=[config_state, config_display] + all_inputs)
         # Selecting a preset in the dropdown should sync immediately;
         # the explicit "Load Preset" button stays as a re-apply affordance.
-        preset_dd.change(fn=apply_preset, inputs=[preset_dd], outputs=all_inputs)
-        reset_btn.click(fn=reset_minimind, outputs=all_inputs)
+        preset_dd.change(fn=apply_preset, inputs=[preset_dd], outputs=[config_state, config_display] + all_inputs)
+        reset_btn.click(fn=reset_minimind, outputs=[config_state, config_display] + all_inputs)
         save_btn.click(fn=do_save, inputs=[config_state, cfg_path], outputs=[save_status])
-        load_btn.click(fn=do_load, inputs=[cfg_path], outputs=[save_status] + all_inputs)
+        load_btn.click(fn=do_load, inputs=[cfg_path], outputs=[save_status, config_state, config_display] + all_inputs)
 
-        _initial_cfg = ChronosConfig().__dict__
-        total_box.value, active_box.value, vram_box.value, ssd_box.value, kv_box.value, tps_box.value = _estimate(_initial_cfg)
+        total_box.value, active_box.value, vram_box.value, ssd_box.value, kv_box.value, tps_box.value = _estimate(initial_cfg)
 
     return config_state, all_inputs, save_dir

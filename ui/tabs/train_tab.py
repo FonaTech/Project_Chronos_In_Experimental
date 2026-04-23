@@ -2,6 +2,7 @@
 ui/tabs/train_tab.py — Full training loop: Pretrain / SFT / DPO / ORPO / GRPO / Distill
 """
 import os
+import glob
 import time
 import threading
 import queue
@@ -47,6 +48,18 @@ STAGE_DEFAULT_DATA = {
     "grpo": "./tests/fixtures/tiny_grpo.jsonl",
     "distill": "./tests/fixtures/tiny_sft.jsonl",
 }
+CHECKPOINT_TOPOLOGY_KEYS = (
+    "hidden_size",
+    "num_hidden_layers",
+    "num_experts",
+    "moe_intermediate_size",
+    "vocab_size",
+    "lookahead_steps",
+    "kv_latent_dim",
+    "rope_dim",
+    "num_attention_heads",
+    "num_key_value_heads",
+)
 STAGE_HELP_TEXT = {
     "pretrain": {
         "zh-Hans": "从通用语料继续预训练。`init_weight` 可留空；若存在同名 checkpoint，将按当前拓扑尝试恢复。",
@@ -394,7 +407,36 @@ def _sniff_checkpoint(path: str) -> dict:
             total = int(lookahead_proj.shape[0])
             n_exp = int(out["num_experts"])
             if n_exp > 0 and total % n_exp == 0:
-                out["lookahead_steps"] = total // n_exp
+                # The router predicts current-token routing plus K future
+                # steps, so the saved output rows are (lookahead_steps + 1)
+                # * num_experts. Do not report the +1 as user topology.
+                out["lookahead_steps"] = max(0, total // n_exp - 1)
+
+        qnope = sd.get("model.layers.0.self_attn.q_nope_proj.weight")
+        qrope = sd.get("model.layers.0.self_attn.q_rope_proj.weight")
+        kvdown = sd.get("model.layers.0.self_attn.kv_down_proj.weight")
+        vproj = sd.get("model.layers.0.self_attn.v_proj.weight")
+        if qnope is not None and qrope is not None and out.get("hidden_size"):
+            candidates = [
+                n for n in range(1, out["hidden_size"] + 1)
+                if out["hidden_size"] % n == 0
+                and int(qrope.shape[0]) % n == 0
+                and int(qnope.shape[0]) % n == 0
+            ]
+            if candidates:
+                preferred = 8 if 8 in candidates else max(candidates)
+                head_dim = out["hidden_size"] // preferred
+                rope_dim = int(qrope.shape[0]) // preferred
+                nope_dim = int(qnope.shape[0]) // preferred
+                if rope_dim + nope_dim == head_dim:
+                    out["num_attention_heads"] = preferred
+                    out["rope_dim"] = rope_dim
+        if kvdown is not None:
+            out["kv_latent_dim"] = int(kvdown.shape[0])
+        if vproj is not None and out.get("kv_latent_dim"):
+            head_dim = out.get("hidden_size", 0) // max(out.get("num_attention_heads", 8), 1)
+            if head_dim > 0:
+                out["num_key_value_heads"] = max(1, int(vproj.shape[0]) // head_dim)
 
         return out
     except Exception:
@@ -477,15 +519,41 @@ class TrainSession:
             return ""
         return os.path.join(save_dir, f"{upstream}_{hidden_size}_moe.pth")
 
+    def _resolve_default_init_path(self, save_dir: str, mode: str, hidden_size: int) -> str:
+        exact = self._default_init_path(save_dir, mode, hidden_size)
+        if os.path.exists(exact):
+            return exact
+        upstream = STAGE_DEFAULT_INIT.get(mode)
+        if not upstream:
+            return exact
+        candidates = [
+            p for p in glob.glob(os.path.join(save_dir, f"{upstream}_*_moe.pth"))
+            if os.path.isfile(p)
+        ]
+        if not candidates:
+            return exact
+        return max(candidates, key=os.path.getmtime)
+
     def _topology_mismatches(self, sniffed: dict, model_cfg_kwargs: dict) -> list[str]:
         mismatches = []
-        for k in [
-            "hidden_size", "num_hidden_layers", "num_experts",
-            "moe_intermediate_size", "vocab_size", "lookahead_steps",
-        ]:
+        for k in CHECKPOINT_TOPOLOGY_KEYS:
             if k in sniffed and k in model_cfg_kwargs and int(sniffed[k]) != int(model_cfg_kwargs[k]):
                 mismatches.append(f"{k}: ckpt={sniffed[k]} != ui={model_cfg_kwargs[k]}")
         return mismatches
+
+    def _adopt_checkpoint_topology(self, model_cfg_kwargs: dict, sniffed: dict) -> dict:
+        adopted = {}
+        for key in CHECKPOINT_TOPOLOGY_KEYS:
+            if key not in sniffed:
+                continue
+            current = model_cfg_kwargs.get(key)
+            value = sniffed[key]
+            if current is None or int(current) != int(value):
+                adopted[key] = value
+            model_cfg_kwargs[key] = value
+        if "moe_intermediate_size" in sniffed:
+            model_cfg_kwargs["intermediate_size"] = sniffed["moe_intermediate_size"]
+        return adopted
 
     def _build_stage_args(self, cfg: dict, mode: str, save_dir: str, hidden_size: int):
         reward_spec = (cfg.get("reward_spec") or "toy").strip() or "toy"
@@ -681,6 +749,24 @@ class TrainSession:
                 if opt_key in AUTO_SENTINEL_KEYS and val == 0:
                     continue
                 model_cfg_kwargs[opt_key] = val
+            save_dir = cfg.get("save_dir", "./out")
+            init_weight = (cfg.get("init_weight") or "").strip()
+            load_path = ""
+            init_sniffed = {}
+            if mode != "pretrain":
+                load_path = init_weight or self._resolve_default_init_path(
+                    save_dir, mode, int(model_cfg_kwargs["hidden_size"])
+                )
+                if os.path.exists(load_path):
+                    init_sniffed = _sniff_checkpoint(load_path)
+                    adopted = self._adopt_checkpoint_topology(model_cfg_kwargs, init_sniffed)
+                    if adopted:
+                        summary = ", ".join(f"{k}={v}" for k, v in adopted.items())
+                        self._put(
+                            f"[{mode.upper()}] Adopted topology from init checkpoint "
+                            f"{load_path}: {summary}"
+                        )
+
             model_cfg = ChronosConfig(**model_cfg_kwargs)
             model = ChronosForCausalLM(model_cfg)
             params_m = sum(p.numel() for p in model.parameters()) / 1e6
@@ -689,14 +775,12 @@ class TrainSession:
                       f"E={model_cfg.num_experts}, ffn={model_cfg.intermediate_size}, "
                       f"vocab={model_cfg.vocab_size})")
 
-            save_dir = cfg.get("save_dir", "./out")
             ckp_path = self._stage_checkpoint_path(save_dir, mode, model_cfg.hidden_size)
 
             # Init-weight resolution:
             #   - pretrain: optionally resume from its own checkpoint if present
             #   - other stages: require an upstream weight (explicit init_weight
             #     or the stage's default predecessor checkpoint).
-            init_weight = (cfg.get("init_weight") or "").strip()
             if mode == "pretrain":
                 resume_path = init_weight or ckp_path
                 if os.path.exists(resume_path):
@@ -714,7 +798,6 @@ class TrainSession:
                 else:
                     self._put("Pretraining from random init")
             else:
-                load_path = init_weight or self._default_init_path(save_dir, mode, model_cfg.hidden_size)
                 if not os.path.exists(load_path):
                     raise FileNotFoundError(
                         f"[{mode.upper()}] requires an upstream checkpoint to initialize from. "
@@ -723,7 +806,7 @@ class TrainSession:
                         f"or run the prior stage first."
                     )
 
-                sniffed = _sniff_checkpoint(load_path)
+                sniffed = init_sniffed or _sniff_checkpoint(load_path)
                 mismatch_hints = self._topology_mismatches(sniffed, model_cfg_kwargs)
                 if mismatch_hints:
                     raise RuntimeError(
