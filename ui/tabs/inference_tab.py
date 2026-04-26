@@ -171,10 +171,12 @@ def _memory_delta(after: dict, before: dict, key: str) -> float:
 
 def _actual_active_expert_count(model_cfg) -> int:
     num_experts = int(getattr(model_cfg, "num_experts", 1) or 1)
-    recommended = getattr(model_cfg, "recommended_resident_experts", None)
-    if recommended not in (None, "", 0):
+    for attr in ("observed_active_experts", "offload_working_set_experts", "recommended_working_set_experts"):
+        value = getattr(model_cfg, attr, None)
+        if value in (None, "", 0):
+            continue
         try:
-            return max(1, min(num_experts, int(recommended)))
+            return max(1, min(num_experts, int(value)))
         except (TypeError, ValueError):
             pass
     top_k = int(getattr(model_cfg, "num_experts_per_tok", 1) or 1)
@@ -189,10 +191,10 @@ def _actual_active_expert_count(model_cfg) -> int:
 def _bounded_offload_expert_budget(model_cfg, ram_load_ratio: float | str | None = 1.0) -> dict:
     """Derive the offload cache budget from the trained MoE topology.
 
-    The ideal active count is the checkpoint's ``num_experts_per_tok``. The
-    user-controlled ratio can reduce RAM pressure for experiments, but the
-    effective load is floored at 125% of the actual active top-k experts so the
-    lazy path cannot silently become a near-full-load baseline.
+    The ideal active count is the routed working set, not the checkpoint's
+    recommended resident cache size. The user-controlled ratio must produce
+    real lower-budget runs for sweeps; exact quality is preserved by
+    on-demand materialisation rather than by silently clamping to top-k.
     """
     active = _actual_active_expert_count(model_cfg)
     num_experts = int(getattr(model_cfg, "num_experts", active) or active)
@@ -202,14 +204,11 @@ def _bounded_offload_expert_budget(model_cfg, ram_load_ratio: float | str | None
         ratio = 1.0
     ratio = max(0.01, ratio)
     routing_top_k = int(getattr(model_cfg, "num_experts_per_tok", active) or active)
-    min_vram = max(1, min(num_experts, routing_top_k))
+    min_vram = 1
     hard_cap = max(active, int(math.floor(active * 1.25)))
     requested = max(1, int(math.ceil(active * ratio)))
     effective = max(min_vram, min(num_experts, requested, hard_cap))
-    # RAM is a prediction buffer, but it must still obey the offload contract:
-    # compare/offload may read a cluster around the needed expert, never
-    # silently become a full-DRAM run.
-    ram_buffer = max(effective, min(num_experts, hard_cap, max(active, int(math.ceil(effective * 2.0)))))
+    ram_buffer = effective
     return {
         "ideal_active_experts": active,
         "routing_top_k": routing_top_k,
@@ -223,6 +222,20 @@ def _bounded_offload_expert_budget(model_cfg, ram_load_ratio: float | str | None
         "min_vram_expert_budget": min_vram,
         "budget_clamped": effective != requested,
     }
+
+
+def _clone_model_cfg(model_cfg):
+    from chronos.model.config import ChronosConfig
+
+    try:
+        data = dict(model_cfg.to_dict())
+    except Exception:
+        data = dict(getattr(model_cfg, "__dict__", {}))
+    data.pop("architectures", None)
+    data.pop("transformers_version", None)
+    data.pop("_name_or_path", None)
+    data.pop("_commit_hash", None)
+    return ChronosConfig(**data)
 
 
 def _apply_offload_expert_budget(engine, model_cfg, ram_load_ratio: float | str | None = 1.0) -> dict:
@@ -707,6 +720,8 @@ def _run_torch_full_dram(backend: str, model_cfg, model_path_val: str, token_ids
 def _run_mlx_full_dram(model_cfg, model_path_val: str, token_ids: list[int],
                        max_tok: int, temp: float, do_sample: bool = True) -> tuple[list[int], dict]:
     import os
+    import time as _time
+    import gc
     import torch
     import mlx.core as mx
     from chronos.model.model_chronos import ChronosForCausalLM
@@ -715,6 +730,9 @@ def _run_mlx_full_dram(model_cfg, model_path_val: str, token_ids: list[int],
     from chronos.mlx.model import ChronosMLXModel
     from chronos.mlx.inference import ChronosMLXInferenceEngine
 
+    setup_t0 = _time.monotonic()
+    setup_mem0 = _memory_snapshot_gb()
+    backend_mem0 = _backend_memory_snapshot("mlx")
     if model_path_val and is_export_artifact(model_path_val):
         weights = open_export_reader(model_path_val).load_state_dict(include_experts=True)
     elif model_path_val and os.path.exists(model_path_val):
@@ -723,21 +741,54 @@ def _run_mlx_full_dram(model_cfg, model_path_val: str, token_ids: list[int],
         weights = {}
 
     pt_model = ChronosForCausalLM(model_cfg)
+    model_init_mem = _memory_snapshot_gb()
     if weights:
         load_state_dict_controlled(pt_model, weights)
+        del weights
+        weights = {}
+        gc.collect()
+    weight_load_mem = _memory_snapshot_gb()
     mlx_model = ChronosMLXModel.from_chronos_pytorch(pt_model, model_cfg)
+    del pt_model
+    gc.collect()
+    setup_mem1 = _memory_snapshot_gb()
+    backend_mem_setup = _backend_memory_snapshot("mlx")
     engine = ChronosMLXInferenceEngine(mlx_model, model_cfg)
     engine.store.storage_format = "full_dram"
     try:
         ids = mx.array([token_ids])
+        run_t0 = _time.monotonic()
         tokens = list(engine.generate(
             ids,
             max_new_tokens=int(max_tok),
             temperature=float(temp) if do_sample else 0.0,
             top_p=0.85,
         ))
+        run_elapsed = _time.monotonic() - run_t0
+        end_mem = _memory_snapshot_gb()
+        backend_mem_end = _backend_memory_snapshot("mlx")
         stats = dict(getattr(engine, "last_stats", {}))
+        prefill_mem = float(stats.get("rss_after_prefill_gb", setup_mem1) or setup_mem1)
+        prefill_time_s = float(stats.get("prefill_time_s", 0.0) or 0.0)
         stats.update({
+            "setup_time_s": round(_time.monotonic() - setup_t0 - run_elapsed, 3),
+            "setup_rss_delta_gb": round(setup_mem1 - setup_mem0, 3),
+            "model_init_rss_delta_gb": round(model_init_mem - setup_mem0, 3),
+            "base_load_rss_delta_gb": round(weight_load_mem - model_init_mem, 3),
+            "device_move_rss_delta_gb": round(setup_mem1 - weight_load_mem, 3),
+            "expert_setup_rss_delta_gb": 0.0,
+            "rss_before_setup_gb": round(setup_mem0, 3),
+            "rss_after_model_init_gb": round(model_init_mem, 3),
+            "rss_after_base_load_gb": round(weight_load_mem, 3),
+            "rss_after_device_move_gb": round(setup_mem1, 3),
+            "rss_after_setup_gb": round(setup_mem1, 3),
+            "prefill_rss_delta_gb": round(prefill_mem - setup_mem1, 3),
+            "decode_rss_delta_gb": round(end_mem - prefill_mem, 3),
+            "rss_before_prefill_gb": round(setup_mem1, 3),
+            "rss_after_prefill_gb": round(prefill_mem, 3),
+            "rss_after_decode_gb": round(end_mem, 3),
+            "prefill_time_s": round(prefill_time_s, 3),
+            "decode_time_s": round(max(0.0, run_elapsed - prefill_time_s), 3),
             "storage_format": "mlx_full_dram",
             "cache_hit_rate": 1.0,
             "resident_hit_rate": 1.0,
@@ -745,6 +796,15 @@ def _run_mlx_full_dram(model_cfg, model_path_val: str, token_ids: list[int],
             "cache_misses": 0,
             "miss_policy": "mlx_full_dram",
         })
+        for snapshot, suffix in [
+            (backend_mem0, "before_setup"),
+            (backend_mem_setup, "after_setup"),
+            (backend_mem_end, "after_decode"),
+        ]:
+            for key in ("mlx_active_gb", "mlx_cache_gb", "mlx_peak_gb"):
+                if key in snapshot:
+                    prefix = key[:-3] if key.endswith("_gb") else key
+                    stats[f"{prefix}_{suffix}_gb"] = snapshot[key]
         return tokens, stats
     finally:
         engine.stop()
@@ -1008,9 +1068,14 @@ def _format_inference_stats(rows: list[dict], diff: dict | None = None) -> str:
         ("Predict hit", lambda r: fmt_pct(r, "prediction_hit_rate")),
         ("Fallback weight", lambda r: fmt_pct(r, "fallback_weight_rate")),
         ("On-demand loads", lambda r: fmt_int(r, "on_demand_loads")),
+        ("Prefetch drops", lambda r: fmt_int(r, "prefetch_queue_drops")),
+        ("Prefetch wait", lambda r: fmt_num(r, "prefetch_wait_time_s", "s")),
+        ("Warm hits", lambda r: fmt_int(r, "warm_hits")),
+        ("Hot evictions", lambda r: fmt_int(r, "hot_evictions")),
+        ("Warm evictions", lambda r: fmt_int(r, "warm_evictions")),
         ("Async misses", lambda r: fmt_int(r, "async_cold_miss_prefetches")),
         ("Sync SSD loads", lambda r: fmt_int(r, "sync_ssd_loads")),
-        ("Hits/Misses", fmt_hits),
+        ("Expert hits/misses", fmt_hits),
         ("Load budget", lambda r: str(r.get("load_budget", "all"))),
         ("VRAM experts", lambda r: str(r.get("vram_experts", ""))),
         ("RAM experts", lambda r: str(r.get("ram_experts", ""))),
@@ -1094,9 +1159,14 @@ def _row_from_stats(mode: str, backend: str, tokens: list[int], elapsed: float,
         "on_demand_loads": stats.get("on_demand_loads", 0),
         "on_demand_load_time_s": stats.get("on_demand_load_time_s", 0.0),
         "async_cold_miss_prefetches": stats.get("async_cold_miss_prefetches", 0),
+        "prefetch_queue_drops": stats.get("prefetch_queue_drops", 0),
+        "prefetch_wait_time_s": stats.get("prefetch_wait_time_s", 0.0),
         "sync_ssd_loads": stats.get("sync_ssd_loads", 0),
         "resident_vram_hits": stats.get("resident_vram_hits", 0),
         "resident_ram_hits": stats.get("resident_ram_hits", 0),
+        "warm_hits": stats.get("warm_hits", 0),
+        "warm_evictions": stats.get("warm_evictions", 0),
+        "hot_evictions": stats.get("hot_evictions", 0),
         "quality_safe": stats.get("quality_safe", mode != "full_dram"),
         "miss_policy": stats.get("miss_policy", "full_dram" if mode == "full_dram" else "on_demand"),
         "cache_hits": stats.get("cache_hits", 0),
@@ -1273,11 +1343,12 @@ def _run_inference_modes(cfg, selected_backend, selected_mode, model_path_val,
     representative_lazy_text = ""
     if mode in {"compare", "offload"}:
         for ratio in ratio_values:
+            run_model_cfg = _clone_model_cfg(model_cfg)
             mem0 = _memory_snapshot_gb()
             t0 = time.monotonic()
             if backend == "mlx":
                 lazy_tokens, lazy_stats = _run_mlx_lazy_inference(
-                    model_cfg,
+                    run_model_cfg,
                     model_path_val,
                     token_ids,
                     int(max_tok),
@@ -1289,7 +1360,7 @@ def _run_inference_modes(cfg, selected_backend, selected_mode, model_path_val,
             else:
                 lazy_tokens, lazy_stats = _run_torch_inference(
                     backend,
-                    model_cfg,
+                    run_model_cfg,
                     model_path_val,
                     token_ids,
                     attn_mask,
@@ -1321,11 +1392,12 @@ def _run_inference_modes(cfg, selected_backend, selected_mode, model_path_val,
 
     full_text = ""
     if mode in {"compare", "fullload"}:
+        full_model_cfg = _clone_model_cfg(model_cfg)
         mem1 = _memory_snapshot_gb()
         t1 = time.monotonic()
         if backend == "mlx":
             full_tokens, full_stats = _run_mlx_full_dram(
-                model_cfg,
+                full_model_cfg,
                 model_path_val,
                 token_ids,
                 int(max_tok),
@@ -1335,7 +1407,7 @@ def _run_inference_modes(cfg, selected_backend, selected_mode, model_path_val,
         else:
             full_tokens, full_stats = _run_torch_full_dram(
                 backend,
-                model_cfg,
+                full_model_cfg,
                 model_path_val,
                 token_ids,
                 attn_mask,

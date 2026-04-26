@@ -120,6 +120,8 @@ class ChronosMLXMOE(nn.Module):
 
                 if python_avail is not None:
                     selected = bool(mx.any(tok_mask).item())
+                    if not selected:
+                        continue
                     is_avail = i in python_avail
                     if selected and not is_avail:
                         loader = getattr(self, "runtime_on_demand_loader", None)

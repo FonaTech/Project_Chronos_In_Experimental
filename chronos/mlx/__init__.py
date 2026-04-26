@@ -16,12 +16,6 @@ Key differences from the CUDA backend:
   - torch.compile unavailable; mx.compile() used instead
   - All modules are mlx.nn.Module, not torch.nn.Module
 """
-from chronos.mlx.model import ChronosMLXModel
-from chronos.mlx.moe import ChronosMLXMOE
-from chronos.mlx.attention import MLAAttentionMLX, SlidingWindowAttentionMLX
-from chronos.mlx.expert_store import MLXExpertStore
-from chronos.mlx.inference import ChronosMLXInferenceEngine
-
 __all__ = [
     "ChronosMLXModel",
     "ChronosMLXMOE",
@@ -30,3 +24,31 @@ __all__ = [
     "MLXExpertStore",
     "ChronosMLXInferenceEngine",
 ]
+
+
+def __getattr__(name):
+    if name == "ChronosMLXModel":
+        from chronos.mlx.model import ChronosMLXModel
+
+        return ChronosMLXModel
+    if name == "ChronosMLXMOE":
+        from chronos.mlx.moe import ChronosMLXMOE
+
+        return ChronosMLXMOE
+    if name == "MLAAttentionMLX":
+        from chronos.mlx.attention import MLAAttentionMLX
+
+        return MLAAttentionMLX
+    if name == "SlidingWindowAttentionMLX":
+        from chronos.mlx.attention import SlidingWindowAttentionMLX
+
+        return SlidingWindowAttentionMLX
+    if name == "MLXExpertStore":
+        from chronos.mlx.expert_store import MLXExpertStore
+
+        return MLXExpertStore
+    if name == "ChronosMLXInferenceEngine":
+        from chronos.mlx.inference import ChronosMLXInferenceEngine
+
+        return ChronosMLXInferenceEngine
+    raise AttributeError(name)

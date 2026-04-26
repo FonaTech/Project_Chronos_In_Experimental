@@ -5,11 +5,7 @@ import os
 import time
 from dataclasses import dataclass
 
-import mlx.core as mx
-import mlx.nn as nn
-import mlx.optimizers as optim
 import torch
-from mlx.utils import tree_map
 
 from chronos.model.model_chronos import ChronosForCausalLM
 from chronos.model.checkpoint import (
@@ -18,10 +14,25 @@ from chronos.model.checkpoint import (
     load_state_dict_controlled,
     save_state_dict_with_config,
 )
-from chronos.mlx.model import ChronosMLXModel
-from chronos.mlx.moe import ChronosMLXMOE
-from chronos.mlx.training.io import mlx_state_to_torch
 from chronos.trainer.optim_utils import get_lr
+
+try:
+    import mlx.core as mx
+    import mlx.nn as nn
+    import mlx.optimizers as optim
+    from mlx.utils import tree_map
+
+    from chronos.mlx.model import ChronosMLXModel
+    from chronos.mlx.moe import ChronosMLXMOE
+    from chronos.mlx.training.io import mlx_state_to_torch
+except ModuleNotFoundError:
+    mx = None
+    nn = None
+    optim = None
+    tree_map = None
+    ChronosMLXModel = None
+    ChronosMLXMOE = None
+    mlx_state_to_torch = None
 
 
 def _ids_to_mx(x) -> mx.array:
@@ -494,7 +505,7 @@ def _planned_total_steps(data_iter, epochs: int, max_steps) -> int:
 def _normalize_mlx_dtype_name(dtype_name: str | None) -> str:
     value = (dtype_name or "auto").strip().lower()
     if value in {"auto", ""}:
-        return "bfloat16" if hasattr(mx, "bfloat16") else "float32"
+        return "bfloat16" if mx is not None and hasattr(mx, "bfloat16") else "float32"
     if value in {"fp16", "float16", "half"}:
         return "float16"
     if value in {"bf16", "bfloat16"}:

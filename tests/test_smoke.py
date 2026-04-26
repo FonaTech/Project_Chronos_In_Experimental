@@ -642,12 +642,16 @@ def test_configure_cpu_threads_overrides_single_thread_env(monkeypatch):
 
 
 def test_configure_cpu_threads_ignores_stale_chronos_env_by_default(monkeypatch):
-    import psutil
     from chronos.trainer.device_utils import configure_cpu_threads, cpu_thread_snapshot
 
     monkeypatch.setenv("CHRONOS_CPU_THREADS", "1")
     monkeypatch.setenv("OMP_NUM_THREADS", "1")
-    physical = int(psutil.cpu_count(logical=False) or os.cpu_count() or 1)
+    try:
+        import psutil
+
+        physical = int(psutil.cpu_count(logical=False) or os.cpu_count() or 1)
+    except Exception:
+        physical = int(os.cpu_count() or 1)
     threads = configure_cpu_threads("auto", budget_percent=100)
     snap = cpu_thread_snapshot()
     assert threads == physical
@@ -2012,6 +2016,8 @@ def test_inference_stats_helpers_are_structured():
             "resident_hit_rate": 0.75,
             "prediction_hit_rate": 0.5,
             "on_demand_loads": 1,
+            "prefetch_queue_drops": 0,
+            "prefetch_wait_time_s": 0.012,
             "async_cold_miss_prefetches": 2,
             "sync_ssd_loads": 1,
             "miss_policy": "on_demand",
@@ -2051,7 +2057,8 @@ def test_inference_stats_helpers_are_structured():
     assert "Setup RSS delta" in md and "Prefill RSS delta" in md and "Decode RSS" in md
     assert "1.200 GB" in md and "2.030 GB" in md
     assert "Load budget" in md
-    assert "On-demand loads" in md and "Async misses" in md and "Predict hit" in md
+    assert "On-demand loads" in md and "Prefetch wait" in md and "Predict hit" in md
+    assert "Expert hits/misses" in md
     assert "lazy_offload" in md and "full_dram" in md
     assert set(df.columns) == {"metric", "mode", "x", "value", "normalized_value", "unit"}
     assert set(df["mode"]) == {"lazy_offload", "full_dram"}
@@ -2074,6 +2081,9 @@ def test_inference_offload_budget_caps_at_125_percent():
     assert budget["effective_vram_expert_budget"] == 6
     assert budget["effective_ram_expert_budget"] == 6
     assert budget["routing_top_k"] == 3
+    low = _bounded_offload_expert_budget(cfg, 0.10)
+    assert low["effective_expert_budget"] == 1
+    assert low["effective_ram_expert_budget"] == 1
     assert budget["num_moe_layers"] == 8
 
     cfg2 = ChronosConfig(num_experts=64, num_experts_per_tok=4, num_hidden_layers=8)
@@ -2090,6 +2100,7 @@ def test_inference_ram_load_ratio_accepts_custom_values():
         RAM_LOAD_RATIO_CHOICES,
         RAM_LOAD_SWEEP_RATIOS,
         _bounded_offload_expert_budget,
+        _clone_model_cfg,
         _normalize_ram_load_ratio,
     )
 
@@ -2101,14 +2112,26 @@ def test_inference_ram_load_ratio_accepts_custom_values():
     custom = _bounded_offload_expert_budget(cfg, "0.33")
     assert custom["requested_ram_load_ratio"] == 0.33
     assert custom["effective_expert_budget"] == 11
-    assert custom["effective_ram_expert_budget"] == 32
+    assert custom["effective_ram_expert_budget"] == 11
 
     custom_high = _bounded_offload_expert_budget(cfg, "1.10")
     assert custom_high["requested_ram_load_ratio"] == 1.1
     assert custom_high["effective_expert_budget"] == 36
-    assert custom_high["effective_ram_expert_budget"] == 40
+    assert custom_high["effective_ram_expert_budget"] == 36
 
     assert _normalize_ram_load_ratio("not-a-number") == 1.0
+
+    small = ChronosConfig(
+        num_experts=6,
+        num_experts_per_tok=3,
+        num_hidden_layers=8,
+        recommended_resident_experts=2,
+    )
+    budgets = [
+        _bounded_offload_expert_budget(_clone_model_cfg(small), ratio)["effective_expert_budget"]
+        for ratio in RAM_LOAD_SWEEP_RATIOS
+    ]
+    assert budgets == [1, 2, 2, 2, 3, 5, 5, 6, 6, 6, 6]
 
 
 def test_generate_api_returns_plain_json_with_chart_records():

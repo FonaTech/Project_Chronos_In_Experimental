@@ -284,11 +284,7 @@ def dataloader_kwargs(
         .lower()
         in {"1", "true", "yes", "on"}
     )
-    force_single_process = (
-        sys.platform == "darwin"
-        and metal_backend
-        and not allow_metal_workers
-    )
+    force_single_process = metal_backend and not allow_metal_workers
     if num_workers in (None, "", "auto"):
         workers = 0 if force_single_process else max(1, min(4, _physical_cores() // 4))
         if device_type == "xpu":
