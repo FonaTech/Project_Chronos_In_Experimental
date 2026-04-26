@@ -195,6 +195,21 @@ Training dtype and resource policy:
 - Native MLX training pushes UI logs, scalar readouts, and chart points every `log_interval` steps, and Web UI Stop is checked at each batch boundary.
 - The Web UI writes a warning-only `<checkpoint>.verify.json` after each stage. It checks no-mask vs all-available MoE parity and, on Apple Silicon, MLX prefill logits against the PyTorch CPU baseline.
 
+Native MLX training is a separate Apple Silicon backend, not `torch.to("mlx")`.
+The six-stage MLX trainer mirrors the PyTorch loss stack in `chronos.mlx.*`:
+masked CE, DPO/ORPO/GRPO/distillation losses, load balance, temporal locality,
+lookahead soft-target supervision, lookahead top-k hit loss, and router KL
+anchor. Numerically sensitive pieces run in FP32 even when model weights use
+BF16/FP16, which is why `auto` prefers BF16 on MLX/MPS: FP16 has too little
+exponent range for router softmax, CE, and Adam moments on small unstable
+training runs.
+
+The MLX Web UI trainer reports the same fields as CPU/MPS training:
+step/loss/steps-per-second/ETA, checkpoint-save events, stop events, and
+verify results. Stop is cooperative at batch boundaries and save intervals
+write a valid `.pth` plus sibling `.config.json`, so MLX stages can resume or
+feed the PyTorch/export pipeline.
+
 The full six-stage comparison harness lives in `tools/compare_minimind_chronos_v3.py`.
 
 ---
@@ -230,6 +245,32 @@ d.describe()    # human-readable capability summary
 - **Apple Silicon policy**: inference auto still prefers MLX; training keeps MLX on the native `chronos.mlx.*` path instead of calling `torch.model.to("mlx")`.
 
 Honest note: upstream PyTorch does not ship a real OpenCL backend, and Vulkan support is still niche. Chronos provides a dispatcher seam so external integrations can plug in cleanly without touching core code.
+
+### MLX lazy/offload runtime
+
+MLX uses Apple unified memory, so Chronos treats "VRAM" and "RAM" as logical
+tiers rather than physical buses. The native lazy runtime still enforces the
+same offload contract as CUDA/MPS/CPU:
+
+- **Hot slots** hold only the execution-budget experts materialized as live
+  MLX modules.
+- **Warm cache** holds a bounded prediction buffer loaded from `.ctsr`
+  safetensors, never a hidden copy of every expert.
+- **Cold storage** is the checkpoint/export reader or per-expert cluster cache.
+  In lazy mode, live experts are replaced by placeholders after cache creation;
+  Chronos does not keep a `_saved_live` full-expert repair cache.
+- Lookahead predictions are queued into the warm cache and only promoted when
+  ready. A true miss synchronously materializes the selected expert only; it
+  does not full-load the model.
+- MLX attention dynamically grows RoPE lookup tables past
+  `max_position_embeddings`, so long prompts plus decode do not fail at token
+  257/513/etc.
+
+Inference compare/sweep reports real hot/warm counts, resident hit rate,
+prediction hit rate, sync SSD loads, MLX active/cache/peak memory, process RSS,
+prefill/decode time, and tokens/sec. A lazy run is not considered
+offload-ready unless deterministic exact-lazy output matches full-DRAM output
+and fallback weight stays zero.
 
 ---
 
@@ -361,7 +402,7 @@ Tabs included:
 - `6-Stage Pipeline` with per-stage dataset paths
 - `Inference`
 - `Export` for FP16/Q8_0 safetensors and GGUF deployment artifacts
-- `Benchmark` with Markdown table + bar plot
+- `Benchmark` with Markdown table + comparison plots
 - `Auto-Tune` with persistent logs and one-click `Apply Best -> Config`
 - `IO Monitor`
 

@@ -145,7 +145,7 @@ class ChronosMLXModel(nn.Module):
         return logits, lookahead_probs, new_caches
 
     @staticmethod
-    def from_chronos_pytorch(pt_model, config):
+    def from_chronos_pytorch(pt_model, config, include_experts: bool = True):
         """
         Convert a trained PyTorch ChronosForCausalLM to ChronosMLXModel.
         Copies weights layer by layer via numpy as bridge.
@@ -202,14 +202,15 @@ class ChronosMLXModel(nn.Module):
             moe = blk.mlp
             if isinstance(moe, ChronosMLXMOE):
                 _assign_linear(moe.gate, sd, f"{prefix}.mlp.gate.weight", missing)
-                for ei, expert in enumerate(moe.experts):
-                    for proj in ("gate_proj", "up_proj", "down_proj"):
-                        _assign_linear(
-                            getattr(expert, proj),
-                            sd,
-                            f"{prefix}.mlp.experts.{ei}.{proj}.weight",
-                            missing,
-                        )
+                if include_experts:
+                    for ei, expert in enumerate(moe.experts):
+                        for proj in ("gate_proj", "up_proj", "down_proj"):
+                            _assign_linear(
+                                getattr(expert, proj),
+                                sd,
+                                f"{prefix}.mlp.experts.{ei}.{proj}.weight",
+                                missing,
+                            )
                 for si, expert in enumerate(moe.shared_experts):
                     for proj in ("gate_proj", "up_proj", "down_proj"):
                         _assign_linear(

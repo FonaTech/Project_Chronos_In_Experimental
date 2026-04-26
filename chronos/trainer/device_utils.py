@@ -13,6 +13,9 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
+TorchDevice = Any
+TorchDType = Any
+
 THREAD_ENV_KEYS = (
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -30,7 +33,7 @@ def _torch():
     return torch
 
 
-def torch_device_type(device: str | torch.device | None) -> str:
+def torch_device_type(device: str | TorchDevice | None) -> str:
     raw = str(device or "cpu").lower()
     if raw.startswith("cuda"):
         return "cuda"
@@ -43,7 +46,7 @@ def torch_device_type(device: str | torch.device | None) -> str:
     return "cpu"
 
 
-def torch_dtype_from_name(name: str | None) -> torch.dtype:
+def torch_dtype_from_name(name: str | None) -> TorchDType:
     torch = _torch()
     value = (name or "float32").strip().lower()
     if value == "auto":
@@ -55,7 +58,7 @@ def torch_dtype_from_name(name: str | None) -> torch.dtype:
     return torch.float32
 
 
-def resolve_dtype_name(device: str | torch.device | None, dtype_name: str | None) -> str:
+def resolve_dtype_name(device: str | TorchDevice | None, dtype_name: str | None) -> str:
     """Resolve user-facing dtype policy to a concrete dtype string.
 
     `auto` is intentionally backend-specific. Apple MPS/MLX default to bf16:
@@ -78,7 +81,7 @@ def resolve_dtype_name(device: str | torch.device | None, dtype_name: str | None
     return "float32"
 
 
-def autocast_context(device: str | torch.device | None, dtype_name: str | None):
+def autocast_context(device: str | TorchDevice | None, dtype_name: str | None):
     """Return an autocast context suitable for CPU/CUDA/MPS/XPU.
 
     MPS supports torch.autocast, but GradScaler is not used there. If the user
@@ -97,7 +100,7 @@ def autocast_context(device: str | torch.device | None, dtype_name: str | None):
         return contextlib.nullcontext()
 
 
-def grad_scaler(device: str | torch.device | None, dtype_name: str | None):
+def grad_scaler(device: str | TorchDevice | None, dtype_name: str | None):
     """GradScaler is CUDA-fp16 only for this project.
 
     MPS uses autocast without scaler; enabling CUDA's legacy scaler on MPS
@@ -269,7 +272,7 @@ def cpu_thread_snapshot() -> dict[str, Any]:
 
 
 def dataloader_kwargs(
-    device: str | torch.device | None = "cpu",
+    device: str | TorchDevice | None = "cpu",
     num_workers: int | str | None = None,
     shuffle: bool = True,
 ) -> dict[str, Any]:
@@ -302,7 +305,7 @@ def dataloader_kwargs(
     }
 
 
-def backend_memory_snapshot(device: str | torch.device | None = None) -> dict[str, float | str]:
+def backend_memory_snapshot(device: str | TorchDevice | None = None) -> dict[str, float | str]:
     torch = _torch()
     out: dict[str, float | str] = {"torch_device_type": torch_device_type(device)}
     try:
@@ -343,7 +346,7 @@ class DeviceRuntimeSummary:
     scaler: bool
 
 
-def runtime_summary(device: str | torch.device | None, dtype_name: str | None) -> DeviceRuntimeSummary:
+def runtime_summary(device: str | TorchDevice | None, dtype_name: str | None) -> DeviceRuntimeSummary:
     torch = _torch()
     device_type = torch_device_type(device)
     resolved = resolve_dtype_name(device, dtype_name)

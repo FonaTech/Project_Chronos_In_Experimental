@@ -206,9 +206,10 @@ def _bounded_offload_expert_budget(model_cfg, ram_load_ratio: float | str | None
     hard_cap = max(active, int(math.floor(active * 1.25)))
     requested = max(1, int(math.ceil(active * ratio)))
     effective = max(min_vram, min(num_experts, requested, hard_cap))
-    # VRAM is the execution set; RAM is the prediction buffer. Keeping RAM
-    # equal to a tiny VRAM budget collapses Chronos into repeated SSD misses.
-    ram_buffer = max(effective, min(num_experts, max(active, int(math.ceil(effective * 2.0)))))
+    # RAM is a prediction buffer, but it must still obey the offload contract:
+    # compare/offload may read a cluster around the needed expert, never
+    # silently become a full-DRAM run.
+    ram_buffer = max(effective, min(num_experts, hard_cap, max(active, int(math.ceil(effective * 2.0)))))
     return {
         "ideal_active_experts": active,
         "routing_top_k": routing_top_k,
@@ -261,6 +262,129 @@ def _replace_torch_experts_with_placeholders(model, model_cfg) -> None:
             continue
         for idx in range(len(moe.experts)):
             moe.experts[idx] = LazyExpertPlaceholder(hidden, intermediate, torch.float16)
+
+
+def _replace_mlx_experts_with_placeholders(model) -> None:
+    import gc
+    import mlx.core as mx
+    from chronos.mlx.moe import ChronosMLXMOE, LazyFeedForwardMLX
+
+    for layer in getattr(model, "layers", []):
+        moe = getattr(layer, "mlp", None)
+        if not isinstance(moe, ChronosMLXMOE):
+            continue
+        for idx in range(len(moe.experts)):
+            moe.experts[idx] = LazyFeedForwardMLX()
+    gc.collect()
+    try:
+        mx.clear_cache()
+    except Exception:
+        pass
+
+
+def _populate_mlx_cache_from_state_dict(store, state_dict: dict) -> None:
+    import os
+    import json
+    import torch
+    from safetensors.numpy import save_file as np_save_file
+    from chronos.io.storage import ClusterManifest, KEY_SEP, MANIFEST_FILENAME
+
+    os.makedirs(store.ssd_dir, exist_ok=True)
+    manifest_clusters = {}
+    expert_to_cluster = {}
+    for eid in range(int(store.num_experts)):
+        tensors = {}
+        for li in range(int(store.num_layers)):
+            prefix = f"model.layers.{li}.mlp.experts.{eid}."
+            for pname in store._PARAM_NAMES:
+                key = prefix + pname
+                if key in state_dict:
+                    tensors[f"l{li}_e{eid}{KEY_SEP}{pname}"] = (
+                        state_dict[key].detach().to(dtype=torch.float16, device="cpu").numpy()
+                    )
+        if tensors:
+            file_name = f"cluster_{eid}.ctsr"
+            np_save_file(tensors, os.path.join(store.ssd_dir, file_name))
+            manifest_clusters[eid] = (file_name, [eid])
+            expert_to_cluster[eid] = eid
+    if len(expert_to_cluster) != int(store.num_experts):
+        raise RuntimeError(
+            f"MLX lazy cache is incomplete: wrote {len(expert_to_cluster)}/{int(store.num_experts)} experts"
+        )
+    manifest = ClusterManifest(
+        version=1,
+        num_experts=int(store.num_experts),
+        num_layers=int(store.num_layers),
+        storage_format="safetensors",
+        clusters=manifest_clusters,
+        expert_to_cluster=expert_to_cluster,
+    )
+    with open(os.path.join(store.ssd_dir, MANIFEST_FILENAME), "w", encoding="utf-8") as f:
+        json.dump(manifest.to_dict(), f, indent=2)
+
+
+def _populate_mlx_cache_from_reader(store, reader) -> None:
+    import os
+    import json
+    import torch
+    from safetensors.numpy import save_file as np_save_file
+    from chronos.io.storage import ClusterManifest, KEY_SEP, MANIFEST_FILENAME
+
+    os.makedirs(store.ssd_dir, exist_ok=True)
+    keys = set(reader.keys())
+    manifest_clusters = {}
+    expert_to_cluster = {}
+    for eid in range(int(store.num_experts)):
+        tensors = {}
+        for li in range(int(store.num_layers)):
+            prefix = f"model.layers.{li}.mlp.experts.{eid}."
+            for pname in store._PARAM_NAMES:
+                key = prefix + pname
+                if key in keys:
+                    tensors[f"l{li}_e{eid}{KEY_SEP}{pname}"] = (
+                        reader.get_tensor(key).detach().to(dtype=torch.float16, device="cpu").numpy()
+                    )
+        if tensors:
+            file_name = f"cluster_{eid}.ctsr"
+            np_save_file(tensors, os.path.join(store.ssd_dir, file_name))
+            manifest_clusters[eid] = (file_name, [eid])
+            expert_to_cluster[eid] = eid
+    if len(expert_to_cluster) != int(store.num_experts):
+        raise RuntimeError(
+            f"MLX lazy cache is incomplete: wrote {len(expert_to_cluster)}/{int(store.num_experts)} experts"
+        )
+    manifest = ClusterManifest(
+        version=1,
+        num_experts=int(store.num_experts),
+        num_layers=int(store.num_layers),
+        storage_format="safetensors",
+        clusters=manifest_clusters,
+        expert_to_cluster=expert_to_cluster,
+    )
+    with open(os.path.join(store.ssd_dir, MANIFEST_FILENAME), "w", encoding="utf-8") as f:
+        json.dump(manifest.to_dict(), f, indent=2)
+
+
+def _rebuild_mlx_lazy_cache(store, cache_dir: str, reader, weights) -> None:
+    import os
+    import shutil
+
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+    store.ssd_dir = cache_dir
+    store._cluster_manifest = None
+    store._loaded_clusters.clear()
+    store._warm.clear()
+    store._warm_lru.clear()
+    if reader is not None:
+        _populate_mlx_cache_from_reader(store, reader)
+    elif weights is not None:
+        _populate_mlx_cache_from_state_dict(store, weights)
+    else:
+        store.offload_all_to_ssd(clusters=[[i] for i in range(int(store.num_experts))])
+    if not store.attach_cluster_manifest(cache_dir):
+        raise RuntimeError(f"failed to build a complete MLX lazy expert cache at {cache_dir}")
 
 
 def _encode_prompt(tokenizer, prompt_val: str, raw_prompt: bool = False) -> tuple[list[int], list[int]]:
@@ -631,6 +755,7 @@ def _run_mlx_lazy_inference(model_cfg, model_path_val: str, token_ids: list[int]
                             ram_load_ratio: float | str | None = 1.0,
                             quality_safe: bool = True) -> tuple[list[int], dict]:
     import os
+    import gc
     import torch
     import mlx.core as mx
     from chronos.model.model_chronos import ChronosForCausalLM
@@ -639,22 +764,38 @@ def _run_mlx_lazy_inference(model_cfg, model_path_val: str, token_ids: list[int]
     from chronos.mlx.model import ChronosMLXModel
     from chronos.mlx.inference import ChronosMLXInferenceEngine
 
-    if model_path_val and is_export_artifact(model_path_val):
-        weights = open_export_reader(model_path_val).load_state_dict(include_experts=True)
-    elif model_path_val and os.path.exists(model_path_val):
-        weights = load_checkpoint_state_dict(model_path_val, map_location="cpu")
-    else:
-        weights = {}
-
-    pt_model = ChronosForCausalLM(model_cfg)
-    if weights:
-        load_state_dict_controlled(pt_model, weights)
-    mlx_model = ChronosMLXModel.from_chronos_pytorch(pt_model, model_cfg)
-
     budget = _bounded_offload_expert_budget(model_cfg, ram_load_ratio)
     model_cfg.recommended_resident_experts = int(budget["effective_vram_expert_budget"])
     model_cfg.recommended_ram_experts = int(budget["effective_ram_expert_budget"])
     cache_dir = _checkpoint_expert_cache_dir(model_path_val, model_cfg) + "_mlx"
+
+    setup_mem0 = _memory_snapshot_gb()
+    backend_mem0 = _backend_memory_snapshot("mlx")
+    reader = None
+    weights = None
+    if model_path_val and is_export_artifact(model_path_val):
+        reader = open_export_reader(model_path_val)
+        base_only = reader.load_state_dict(include_experts=False)
+    elif model_path_val and os.path.exists(model_path_val):
+        weights = load_checkpoint_state_dict(model_path_val, map_location="cpu")
+        base_only = {k: v for k, v in weights.items() if ".mlp.experts." not in k}
+    else:
+        raise FileNotFoundError("MLX lazy/offload inference requires a checkpoint or export artifact.")
+
+    pt_model = ChronosForCausalLM(model_cfg)
+    if base_only:
+        load_state_dict_controlled(
+            pt_model,
+            base_only,
+            allow_missing_substrings=(".mlp.experts.",),
+        )
+    _replace_torch_experts_with_placeholders(pt_model, model_cfg)
+    model_init_mem = _memory_snapshot_gb()
+    mlx_model = ChronosMLXModel.from_chronos_pytorch(pt_model, model_cfg, include_experts=False)
+    _replace_mlx_experts_with_placeholders(mlx_model)
+    del pt_model
+    gc.collect()
+
     engine = ChronosMLXInferenceEngine(mlx_model, model_cfg, ssd_dir=cache_dir)
     try:
         # MLX lazy mode must keep the same expert budget as the offload path:
@@ -663,12 +804,18 @@ def _run_mlx_lazy_inference(model_cfg, model_path_val: str, token_ids: list[int]
         # budget; selected misses are synchronously materialized expert-by-expert.
         warm_count = int(budget["effective_vram_expert_budget"])
         warm_ids = list(range(min(int(model_cfg.num_experts), warm_count)))
-        if not os.path.exists(os.path.join(cache_dir, "cluster_manifest.json")):
-            engine.setup_with_clusters([[i] for i in range(int(model_cfg.num_experts))], warm_expert_ids=warm_ids)
-        else:
-            engine.store.attach_cluster_manifest(cache_dir)
-            engine.store.replace_live_experts_with_placeholders()
-            engine.store.warm_up(warm_ids)
+        if not engine.store.attach_cluster_manifest(cache_dir):
+            _rebuild_mlx_lazy_cache(engine.store, cache_dir, reader, weights)
+        if reader is not None:
+            del reader
+            reader = None
+        if weights is not None:
+            del weights
+            weights = None
+            gc.collect()
+        engine.store.warm_up(warm_ids)
+        setup_mem1 = _memory_snapshot_gb()
+        backend_mem_setup = _backend_memory_snapshot("mlx")
         ids = mx.array([token_ids])
         tokens = list(engine.generate(
             ids,
@@ -679,6 +826,14 @@ def _run_mlx_lazy_inference(model_cfg, model_path_val: str, token_ids: list[int]
         stats = dict(getattr(engine, "last_stats", {}))
         store_stats = engine.store.stats()
         stats.update({
+            "setup_rss_delta_gb": round(setup_mem1 - setup_mem0, 3),
+            "model_init_rss_delta_gb": round(model_init_mem - setup_mem0, 3),
+            "expert_setup_rss_delta_gb": round(setup_mem1 - model_init_mem, 3),
+            "rss_before_setup_gb": round(setup_mem0, 3),
+            "rss_after_model_init_gb": round(model_init_mem, 3),
+            "rss_after_setup_gb": round(setup_mem1, 3),
+            "rss_after_prefill_gb": stats.get("rss_after_prefill_gb", round(setup_mem1, 3)),
+            "rss_after_decode_gb": stats.get("rss_after_decode_gb", round(setup_mem1, 3)),
             **budget,
             "storage_format": store_stats.get("storage_format", "safetensors"),
             "cluster_aware": store_stats.get("cluster_aware", False),
@@ -687,15 +842,23 @@ def _run_mlx_lazy_inference(model_cfg, model_path_val: str, token_ids: list[int]
             "vram_capacity": store_stats.get("hot_capacity", 0),
             "ram_experts": store_stats.get("warm_experts", 0),
             "ram_capacity_dynamic": store_stats.get("warm_capacity", int(model_cfg.num_experts)),
-            "cache_hit_rate": 1.0,
-            "resident_hit_rate": 1.0,
-            "cache_hits": 0,
-            "cache_misses": 0,
             "miss_policy": "mlx_lazy_quality",
             "quality_safe": quality_safe,
         })
+        for snapshot, suffix in [
+            (backend_mem0, "before_setup"),
+            (backend_mem_setup, "after_setup"),
+        ]:
+            for key in ("mlx_active_gb", "mlx_cache_gb", "mlx_peak_gb"):
+                if key in snapshot:
+                    prefix = key[:-3] if key.endswith("_gb") else key
+                    stats[f"{prefix}_{suffix}_gb"] = snapshot[key]
         return tokens, stats
     finally:
+        if reader is not None:
+            del reader
+        if weights is not None:
+            del weights
         engine.stop()
 
 
@@ -1290,11 +1453,11 @@ def build_inference_tab(config_state: gr.State):
                 label=t("infer.full_output"), lines=10, interactive=False, visible=True,
             )
         stats_md = gr.Markdown(value=_format_inference_stats([]))
-        stats_chart = gr.BarPlot(
+        stats_chart = gr.LinePlot(
             value=_empty_inference_df(),
-            x="metric", y="normalized_value", color="mode",
-            title="Inference comparison by metric",
-            x_title="Metric",
+            x="x", y="normalized_value", color="metric",
+            title="Inference mode comparison",
+            x_title="Mode / RAM load ratio",
             y_title="Normalized value",
             tooltip=["mode", "metric", "value", "unit"],
             sort=None,

@@ -14,6 +14,7 @@ import os
 import json
 import threading
 import collections
+import gc
 from typing import Dict, List, Optional
 
 import mlx.core as mx
@@ -73,7 +74,6 @@ class MLXExpertStore:
         self._loaded_clusters: set[int] = set()
         self.storage_format = "npy"
         self.attach_cluster_manifest(ssd_dir)
-        self._saved_live: Dict[int, Dict[int, Dict[str, mx.array]]] = {}
         self._stats = collections.Counter()
 
     # ── SSD serialisation ─────────────────────────────────────────
@@ -81,7 +81,14 @@ class MLXExpertStore:
     def offload_all_to_ssd(self, clusters: Optional[List[List[int]]] = None):
         """Save all expert weights to SSD as .npy files."""
         if clusters is not None:
+            if self._cluster_cache_complete():
+                self._stats["cluster_cache_reused"] += 1
+                return
             self._write_clustered(clusters)
+            return
+        if self._npy_cache_complete():
+            self.storage_format = "npy"
+            self._stats["npy_cache_reused"] += 1
             return
         for li, moe in enumerate(self.moe_layers):
             for ei, expert in enumerate(moe.experts):
@@ -90,6 +97,17 @@ class MLXExpertStore:
                     path = self._ssd_path(ei, li, f"{proj}.weight")
                     if not os.path.exists(path):
                         np.save(path, np.array(arr))
+
+    def _cluster_cache_complete(self) -> bool:
+        return self.attach_cluster_manifest(self.ssd_dir)
+
+    def _npy_cache_complete(self) -> bool:
+        for li in range(int(self.num_layers)):
+            for ei in range(int(self.num_experts)):
+                for pname in self._PARAM_NAMES:
+                    if not os.path.exists(self._ssd_path(ei, li, pname)):
+                        return False
+        return True
 
     def _write_clustered(self, clusters: List[List[int]]):
         if not _HAS_SAFETENSORS:
@@ -166,10 +184,38 @@ class MLXExpertStore:
                 return False
             if any(int(e) < 0 or int(e) >= int(self.num_experts) for e in experts):
                 return False
+        if not self._cluster_manifest_tensors_complete(manifest, target):
+            return False
         self._cluster_manifest = manifest
         self.ssd_dir = target
         self.storage_format = "safetensors"
         self._loaded_clusters.clear()
+        return True
+
+    def _cluster_manifest_tensors_complete(self, manifest: ClusterManifest, target: str) -> bool:
+        """Validate that every manifest expert has every layer/projection tensor.
+
+        Old development caches only guaranteed that files existed. A stale or
+        partially-written `.ctsr` then failed much later as an on-demand miss.
+        Validate up front so callers can rebuild the cache before generation.
+        """
+        if not _HAS_SAFETENSORS:
+            return False
+        try:
+            for _cid, (file_name, experts) in manifest.clusters.items():
+                path = os.path.join(target, file_name)
+                with _safe_open(path, framework="np") as f:
+                    keys = set(f.keys())
+                for eid in experts:
+                    for li in range(int(self.num_layers)):
+                        for pname in self._PARAM_NAMES:
+                            key = f"l{li}_e{int(eid)}{KEY_SEP}{pname}"
+                            if key not in keys:
+                                self._stats["invalid_cluster_cache"] += 1
+                                return False
+        except Exception:
+            self._stats["invalid_cluster_cache"] += 1
+            return False
         return True
 
     def _parse_cluster_key(self, key: str):
@@ -209,7 +255,9 @@ class MLXExpertStore:
         ordered = sorted(nested.items(), key=lambda item: int(item[0]) == int(expert_id))
         with self._lock:
             for eid, layer_states in ordered:
-                self._put_warm_locked(eid, layer_states)
+                self._put_warm_locked(eid, layer_states, protected_expert_id=int(expert_id))
+                self._stats["cluster_experts_loaded"] += 1
+            self._stats["cluster_loads"] += 1
             self._loaded_clusters.add(cid)
 
     # ── Prefetch (SSD → unified memory) ──────────────────────────
@@ -223,37 +271,64 @@ class MLXExpertStore:
             with self._lock:
                 if eid in self._warm and self._layer_states_complete(self._warm.get(int(eid))):
                     self._touch_warm_locked(int(eid))
+                    self._stats["warm_hits"] += 1
                     continue
-            layer_states = self._complete_or_saved_state(int(eid), self._load_from_ssd(eid))
+            layer_states = self._complete_state(self._load_from_ssd(eid))
             if not layer_states:
                 self._stats["prefetch_misses"] += 1
                 continue
             with self._lock:
-                self._put_warm_locked(int(eid), layer_states)
+                self._put_warm_locked(int(eid), layer_states, protected_expert_id=int(eid))
                 self._stats["prefetch_loads"] += 1
 
     def _touch_warm_locked(self, expert_id: int):
         if expert_id in self._warm_lru:
             self._warm_lru.move_to_end(expert_id)
 
-    def _put_warm_locked(self, expert_id: int, layer_states: Dict[int, Dict[str, mx.array]]):
+    def _put_warm_locked(
+        self,
+        expert_id: int,
+        layer_states: Dict[int, Dict[str, mx.array]],
+        protected_expert_id: int | None = None,
+    ):
         self._warm[expert_id] = layer_states
         self._warm_lru[expert_id] = True
         self._warm_lru.move_to_end(expert_id)
-        self._evict_warm_locked()
+        self._evict_warm_locked(protected_expert_id=protected_expert_id)
 
-    def _evict_warm_locked(self):
+    def _evict_warm_locked(self, protected_expert_id: int | None = None):
         while len(self._warm_lru) > self._warm_capacity:
             evict_id = None
             for candidate in self._warm_lru.keys():
+                if candidate == protected_expert_id:
+                    continue
                 if candidate not in self._hot_lru:
                     evict_id = candidate
                     break
             if evict_id is None:
+                for candidate in self._warm_lru.keys():
+                    if candidate != protected_expert_id:
+                        evict_id = candidate
+                        break
+            if evict_id is None:
                 return
+            evicted_was_hot = evict_id in self._hot_lru
             self._warm_lru.pop(evict_id, None)
             self._warm.pop(evict_id, None)
-            self._replace_expert_with_placeholder(evict_id)
+            if not evicted_was_hot:
+                self._replace_expert_with_placeholder(evict_id)
+            self._loaded_clusters = {
+                cid for cid in self._loaded_clusters
+                if not self._cluster_evicted_locked(cid)
+            }
+            self._stats["warm_evictions"] += 1
+
+    def _cluster_evicted_locked(self, cluster_id: int) -> bool:
+        manifest = self._cluster_manifest
+        if manifest is None:
+            return False
+        _file_name, experts = manifest.clusters[int(cluster_id)]
+        return all(int(eid) not in self._warm for eid in experts)
 
     def _replace_expert_with_placeholder(self, expert_id: int):
         from chronos.mlx.moe import LazyFeedForwardMLX
@@ -278,17 +353,12 @@ class MLXExpertStore:
                 return False
         return True
 
-    def _complete_or_saved_state(
+    def _complete_state(
         self,
-        expert_id: int,
         layer_states: Dict[int, Dict[str, mx.array]] | None,
     ) -> Dict[int, Dict[str, mx.array]]:
         if self._layer_states_complete(layer_states):
             return layer_states or {}
-        saved = self._saved_live.get(int(expert_id), {})
-        if self._layer_states_complete(saved):
-            self._stats["saved_live_repairs"] += 1
-            return saved
         return {}
 
     def _expert_live_all_layers(self, expert_id: int) -> bool:
@@ -352,7 +422,7 @@ class MLXExpertStore:
                 layer_states = self._warm.get(expert_id)
                 if layer_states is not None:
                     self._touch_warm_locked(expert_id)
-        layer_states = self._complete_or_saved_state(expert_id, layer_states)
+        layer_states = self._complete_state(layer_states)
         if not layer_states:
             self._stats["promote_misses"] += 1
             return False
@@ -400,30 +470,22 @@ class MLXExpertStore:
     def replace_live_experts_with_placeholders(self):
         from chronos.mlx.moe import LazyFeedForwardMLX
 
-        for li, moe in enumerate(self.moe_layers):
-            for ei, expert in enumerate(moe.experts):
-                state = {}
-                for proj in ("gate_proj", "up_proj", "down_proj"):
-                    state[f"{proj}.weight"] = getattr(expert, proj).weight
-                self._saved_live.setdefault(ei, {})[li] = state
+        for moe in self.moe_layers:
+            for ei, _expert in enumerate(moe.experts):
                 moe.experts[ei] = LazyFeedForwardMLX()
         with self._lock:
             self._hot_lru.clear()
+        self._stats["live_experts_dropped"] += int(self.num_experts) * int(self.num_layers)
+        gc.collect()
+        try:
+            mx.clear_cache()
+        except Exception:
+            pass
 
     def restore_live_experts_from_saved(self):
-        from chronos.mlx.moe import FeedForwardMLX, LazyFeedForwardMLX
-
-        hidden = int(getattr(self.config, "hidden_size", 0) or 0)
-        intermediate = int(getattr(self.config, "moe_intermediate_size", 0) or 0)
-        for eid, layers in self._saved_live.items():
-            for li, state in layers.items():
-                expert = self.moe_layers[li].experts[eid]
-                if isinstance(expert, LazyFeedForwardMLX):
-                    expert = FeedForwardMLX(hidden, intermediate)
-                    self.moe_layers[li].experts[eid] = expert
-                for fname, arr in state.items():
-                    proj_name = fname.rsplit(".", 1)[0]
-                    getattr(expert, proj_name).weight = arr
+        for eid in range(int(self.num_experts)):
+            self.prefetch_to_ram([eid])
+            self.promote_to_vram(eid)
 
     def sync_h2d(self):
         """No-op on MLX — Metal handles synchronisation internally."""

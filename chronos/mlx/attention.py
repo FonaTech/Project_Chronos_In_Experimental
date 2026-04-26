@@ -59,7 +59,39 @@ def _apply_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     return (x * c + rotated_half * s).astype(x.dtype)
 
 
-class MLAAttentionMLX(nn.Module):
+class _RopeCacheMixin:
+    def _init_rope_cache(self, config, dim: int) -> None:
+        rope_len = int(getattr(config, "max_position_embeddings", 4096))
+        object.__setattr__(self, "_rope_dim", int(dim))
+        object.__setattr__(self, "_rope_base", float(getattr(config, "rope_theta", 1_000_000.0)))
+        object.__setattr__(self, "_rope_scaling", getattr(config, "rope_scaling", None))
+        cos, sin = _rope_freqs(
+            int(dim),
+            max_len=rope_len,
+            base=self._rope_base,
+            rope_scaling=self._rope_scaling,
+        )
+        object.__setattr__(self, "_cos", cos)
+        object.__setattr__(self, "_sin", sin)
+
+    def _ensure_rope_cache(self, needed_len: int) -> None:
+        current_len = int(self._cos.shape[0])
+        if int(needed_len) <= current_len:
+            return
+        # Grow geometrically to avoid reallocating every decode step past
+        # max_position_embeddings.
+        new_len = max(int(needed_len), current_len * 2)
+        cos, sin = _rope_freqs(
+            int(self._rope_dim),
+            max_len=new_len,
+            base=float(self._rope_base),
+            rope_scaling=self._rope_scaling,
+        )
+        object.__setattr__(self, "_cos", cos)
+        object.__setattr__(self, "_sin", sin)
+
+
+class MLAAttentionMLX(_RopeCacheMixin, nn.Module):
     """
     Multi-head Latent Attention for MLX.
 
@@ -94,17 +126,7 @@ class MLAAttentionMLX(nn.Module):
         self.v_proj       = nn.Linear(self.kv_latent_dim, self.n_kv_heads * self.head_dim, bias=False)
         self.o_proj       = nn.Linear(self.n_heads * self.head_dim, H, bias=False)
 
-        rope_len = int(getattr(config, "max_position_embeddings", 4096))
-        cos, sin = _rope_freqs(
-            self.head_dim,
-            max_len=rope_len,
-            base=float(getattr(config, "rope_theta", 1_000_000.0)),
-            rope_scaling=getattr(config, "rope_scaling", None),
-        )
-        # Bypass mlx.nn.Module.__setattr__; these are runtime lookup tables,
-        # not trainable checkpoint parameters.
-        object.__setattr__(self, "_cos", cos)
-        object.__setattr__(self, "_sin", sin)
+        self._init_rope_cache(config, self.head_dim)
 
     def __call__(
         self,
@@ -134,6 +156,7 @@ class MLAAttentionMLX(nn.Module):
             k_rope_past = None
 
         T_full = c_kv_full.shape[1]
+        self._ensure_rope_cache(T_full)
 
         # ── Keys / Values (recomputed from cache) ─────────────────
         k_nope = self.k_nope_proj(c_kv_full).reshape(B, T_full, self.n_kv_heads, self.nope_dim)
@@ -172,7 +195,7 @@ class MLAAttentionMLX(nn.Module):
         return self.o_proj(out), new_cache
 
 
-class SlidingWindowAttentionMLX(nn.Module):
+class SlidingWindowAttentionMLX(_RopeCacheMixin, nn.Module):
     """
     Standard multi-head attention with a sliding KV window for MLX.
     KV cache is capped at window_size tokens — O(1) memory per step.
@@ -193,15 +216,7 @@ class SlidingWindowAttentionMLX(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        rope_len = int(getattr(config, "max_position_embeddings", 4096))
-        cos, sin = _rope_freqs(
-            self.head_dim,
-            max_len=rope_len,
-            base=float(getattr(config, "rope_theta", 1_000_000.0)),
-            rope_scaling=getattr(config, "rope_scaling", None),
-        )
-        object.__setattr__(self, "_cos", cos)
-        object.__setattr__(self, "_sin", sin)
+        self._init_rope_cache(config, self.head_dim)
 
     def __call__(
         self,
@@ -216,6 +231,7 @@ class SlidingWindowAttentionMLX(nn.Module):
         v_new = self.v_proj(x).reshape(B, S, self.n_kv_heads, self.head_dim)
 
         past_len = cache[0].shape[1] if cache is not None else 0
+        self._ensure_rope_cache(past_len + S)
         q = _apply_rope(q, self._cos[past_len:past_len + S], self._sin[past_len:past_len + S])
         k_new = _apply_rope(k_new, self._cos[past_len:past_len + S], self._sin[past_len:past_len + S])
 

@@ -1373,6 +1373,108 @@ def test_mlx_lazy_store_materializes_every_layer_and_rejects_tensor_mask(tmp_pat
         mlx_model.layers[0].mlp(x, available_expert_mask=store.vram_availability_mask())
 
 
+def test_mlx_lazy_store_does_not_keep_saved_live_cache(tmp_path):
+    if not _mlx_available():
+        return
+    from chronos.model.config import ChronosConfig
+    from chronos.model.model_chronos import ChronosForCausalLM
+    from chronos.mlx.expert_store import MLXExpertStore
+    from chronos.mlx.model import ChronosMLXModel
+    from chronos.mlx.moe import LazyFeedForwardMLX
+
+    cfg = ChronosConfig(hidden_size=32, num_hidden_layers=1, num_experts=3,
+                        num_experts_per_tok=1, num_shared_experts=1,
+                        num_attention_heads=2, num_key_value_heads=2,
+                        kv_latent_dim=8, rope_dim=4, max_seq_len=16,
+                        vocab_size=128, use_moe=True)
+    mlx_model = ChronosMLXModel.from_chronos_pytorch(ChronosForCausalLM(cfg).eval(), cfg)
+    store = MLXExpertStore(mlx_model, cfg, ssd_dir=str(tmp_path / "mlx_no_saved_live"))
+    store.offload_all_to_ssd(clusters=[[0], [1], [2]])
+    store.replace_live_experts_with_placeholders()
+    assert not hasattr(store, "_saved_live")
+    assert all(isinstance(mlx_model.layers[0].mlp.experts[i], LazyFeedForwardMLX) for i in range(3))
+    store.prefetch_to_ram([0])
+    assert store.promote_to_vram(0) is True
+    assert store.hot_expert_ids() == {0}
+
+
+def test_mlx_cache_populate_from_state_dict_uses_per_expert_clusters(tmp_path):
+    if not _mlx_available():
+        return
+    from chronos.model.config import ChronosConfig
+    from chronos.model.model_chronos import ChronosForCausalLM
+    from chronos.mlx.expert_store import MLXExpertStore
+    from chronos.mlx.model import ChronosMLXModel
+    from ui.tabs.inference_tab import _populate_mlx_cache_from_state_dict
+
+    cfg = ChronosConfig(hidden_size=32, num_hidden_layers=1, num_experts=4,
+                        num_experts_per_tok=1, num_shared_experts=1,
+                        num_attention_heads=2, num_key_value_heads=2,
+                        kv_latent_dim=8, rope_dim=4, max_seq_len=16,
+                        vocab_size=128, use_moe=True,
+                        recommended_resident_experts=1,
+                        recommended_ram_experts=2)
+    pt = ChronosForCausalLM(cfg).eval()
+    mlx_model = ChronosMLXModel.from_chronos_pytorch(pt, cfg, include_experts=False)
+    store = MLXExpertStore(mlx_model, cfg, ssd_dir=str(tmp_path / "mlx_populate"))
+    _populate_mlx_cache_from_state_dict(store, pt.state_dict())
+    assert store.attach_cluster_manifest(str(tmp_path / "mlx_populate")) is True
+    assert store.stats()["num_clusters"] == cfg.num_experts
+    store.prefetch_to_ram([0])
+    assert set(store._warm.keys()) == {0}
+    store.prefetch_to_ram([1, 2])
+    assert len(store._warm) <= 2
+
+
+def test_mlx_on_demand_load_survives_tight_warm_budget(tmp_path):
+    if not _mlx_available():
+        return
+    from chronos.model.config import ChronosConfig
+    from chronos.model.model_chronos import ChronosForCausalLM
+    from chronos.mlx.expert_store import MLXExpertStore
+    from chronos.mlx.model import ChronosMLXModel
+    from ui.tabs.inference_tab import _populate_mlx_cache_from_state_dict
+
+    cfg = ChronosConfig(hidden_size=32, num_hidden_layers=1, num_experts=4,
+                        num_experts_per_tok=1, num_shared_experts=1,
+                        num_attention_heads=2, num_key_value_heads=2,
+                        kv_latent_dim=8, rope_dim=4, max_seq_len=16,
+                        vocab_size=128, use_moe=True,
+                        recommended_resident_experts=1,
+                        recommended_ram_experts=1)
+    pt = ChronosForCausalLM(cfg).eval()
+    mlx_model = ChronosMLXModel.from_chronos_pytorch(pt, cfg, include_experts=False)
+    store = MLXExpertStore(mlx_model, cfg, ssd_dir=str(tmp_path / "mlx_tight_budget"))
+    _populate_mlx_cache_from_state_dict(store, pt.state_dict())
+    assert store.attach_cluster_manifest(str(tmp_path / "mlx_tight_budget")) is True
+
+    store.warm_up([0])
+    assert store.hot_expert_ids() == {0}
+    assert set(store._warm.keys()) == {0}
+    assert store.promote_to_vram(3) is True
+    assert store.hot_expert_ids() == {3}
+    assert set(store._warm.keys()) == {3}
+
+
+def test_mlx_rope_cache_grows_past_configured_context():
+    if not _mlx_available():
+        return
+    import mlx.core as mx
+    from chronos.model.config import ChronosConfig
+    from chronos.mlx.attention import MLAAttentionMLX, SlidingWindowAttentionMLX
+
+    cfg = ChronosConfig(hidden_size=128, num_attention_heads=4, num_key_value_heads=4,
+                        kv_latent_dim=16, rope_dim=32, max_seq_len=256,
+                        sliding_window_size=512, vocab_size=128)
+    for cls in (MLAAttentionMLX, SlidingWindowAttentionMLX):
+        attn = cls(cfg)
+        x = mx.zeros((1, 257, cfg.hidden_size), dtype=mx.float32)
+        y, cache = attn(x)
+        mx.eval(y)
+        assert y.shape == x.shape
+        assert attn._cos.shape[0] >= 257
+
+
 def test_mlx_auto_dtype_prefers_bfloat16():
     from chronos.mlx.training.trainer import _normalize_mlx_dtype_name
 
@@ -1979,7 +2081,7 @@ def test_inference_offload_budget_caps_at_125_percent():
     assert budget2["ideal_active_experts"] == 32
     assert budget2["max_allowed_expert_budget"] == 40
     assert budget2["effective_expert_budget"] == 40
-    assert budget2["effective_ram_expert_budget"] == 64
+    assert budget2["effective_ram_expert_budget"] == 40
 
 
 def test_inference_ram_load_ratio_accepts_custom_values():
@@ -2004,7 +2106,7 @@ def test_inference_ram_load_ratio_accepts_custom_values():
     custom_high = _bounded_offload_expert_budget(cfg, "1.10")
     assert custom_high["requested_ram_load_ratio"] == 1.1
     assert custom_high["effective_expert_budget"] == 36
-    assert custom_high["effective_ram_expert_budget"] == 64
+    assert custom_high["effective_ram_expert_budget"] == 40
 
     assert _normalize_ram_load_ratio("not-a-number") == 1.0
 

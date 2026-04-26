@@ -189,6 +189,19 @@ flowchart LR
 - MLX 原生训练会按 `log_interval` 同步 UI 日志、标量读数和图表点；Web UI Stop 会在每个 batch 边界检查并停止。
 - Web UI 每阶段保存后会写出 warning-only 的 `<checkpoint>.verify.json`，检查 no-mask vs all-available MoE 等价性，并在 Apple Silicon 上对比 MLX prefill logits 与 PyTorch CPU baseline。
 
+MLX 训练是 Apple Silicon 原生后端，不是 `torch.to("mlx")`。六阶段 MLX
+trainer 在 `chronos.mlx.*` 中复刻 PyTorch 训练栈：masked CE、DPO/ORPO/GRPO/
+蒸馏损失、load balance、temporal locality、lookahead soft-target 监督、
+lookahead top-k 命中损失、router KL anchor。即使权重使用 BF16/FP16，路由
+softmax、CE、Adam moments 等数值敏感路径仍以 FP32 计算；因此 `auto` 在
+MLX/MPS 上默认优先 BF16。FP16 的指数范围太小，在小模型/小 batch/路由分布
+剧烈波动时更容易把 loss 推成 NaN。
+
+Web UI 的 MLX 训练日志与 CPU/MPS 对齐：step、loss、steps/s、ETA、
+checkpoint 保存事件、stop 事件、verify 结果都会同步到界面。Stop 在 batch
+边界协作式生效；定期保存会写出可继续训练的 `.pth` 与同名 `.config.json`，
+因此 MLX 阶段可以继续接 PyTorch、Export、Diagnose 链路。
+
 完整 6 阶段端到端对比见 `tools/compare_minimind_chronos_v3.py`。
 
 ---
@@ -223,6 +236,28 @@ d.describe()       # 人类可读的能力总览
 - **Apple Silicon 策略**：推理 auto 仍优先 MLX；训练会走原生 `chronos.mlx.*` 路径，不会把 PyTorch 模型错误地 `.to("mlx")`。
 
 诚实声明：上游 PyTorch 没有 OpenCL 后端、Vulkan 也仅在自定义构建中可用。Chronos 提供 dispatcher 接缝，使第三方插件无需改核心代码即可接入。
+
+### MLX lazy/offload 运行时
+
+MLX 使用 Apple 统一内存，因此 Chronos 在 MLX 上的 “VRAM/RAM” 是逻辑分层，
+不是 PCIe 式物理分层。但 lazy runtime 仍严格遵守与 CUDA/MPS/CPU 一致的
+offload contract：
+
+- **Hot slots**：只保存执行预算内、已经 materialize 成 MLX live module 的专家。
+- **Warm cache**：只保存有界预测缓冲，从 `.ctsr` safetensors 中按专家/簇加载；
+  不允许暗中保留全量专家副本。
+- **Cold storage**：checkpoint/export reader 或 per-expert cluster cache。Lazy
+  模式创建 cache 后会把 live experts 替换为 placeholder；不会保留 `_saved_live`
+  这种全量专家修复缓存。
+- Lookahead 预测只进入 warm cache 队列，只有 ready 的专家才会 promote。真实 miss
+  只同步 materialize 当前被选中的专家，不会 full-load 整个模型。
+- MLX attention 会按需扩容 RoPE lookup table，因此 prompt 长度加 decode 超过
+  `max_position_embeddings` 时不会在第 257/513 等 token 崩溃。
+
+Inference compare/sweep 会报告真实 hot/warm 数量、resident hit、prediction hit、
+sync SSD loads、MLX active/cache/peak memory、进程 RSS、prefill/decode 时间与
+tokens/s。只有确定性 exact-lazy 输出与 full-DRAM 一致、且 fallback weight 为 0，
+才应该把该 checkpoint 标记为 offload-ready。
 
 ---
 
@@ -344,7 +379,7 @@ chronos-ui
 python chronos_app.py
 ```
 
-包含：⚙️ Config（含右侧实时参数估算面板，合并了 Designer）/ 🏋️ Train（拥有 data_path）/ 🧪 6-Stage Pipeline（每阶段独立数据路径）/ 💬 Inference（含懒加载 vs 全量 DRAM 对比）/ 📦 Export（FP16/Q8_0 safetensors 与 GGUF）/ 📊 Benchmark（Markdown 表 + BarPlot）/ 🔬 Auto-Tune（持久化日志 + 一键 Apply Best → Config）/ 📡 IO Monitor。i18n 支持 zh-Hans / zh-Hant / en / ja。
+包含：⚙️ Config（含右侧实时参数估算面板，合并了 Designer）/ 🏋️ Train（拥有 data_path）/ 🧪 6-Stage Pipeline（每阶段独立数据路径）/ 💬 Inference（含懒加载 vs 全量 DRAM 对比）/ 📦 Export（FP16/Q8_0 safetensors 与 GGUF）/ 📊 Benchmark（Markdown 表 + 对比图）/ 🔬 Auto-Tune（持久化日志 + 一键 Apply Best → Config）/ 📡 IO Monitor。i18n 支持 zh-Hans / zh-Hant / en / ja。
 
 ### 部署导出
 

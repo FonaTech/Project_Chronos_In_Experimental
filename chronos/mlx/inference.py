@@ -45,6 +45,16 @@ class ChronosMLXInferenceEngine:
         )
         self._prefetch_thread.start()
         self.last_stats: dict = {}
+        self._last_predicted: set[int] = set()
+        self._stats_lock = threading.Lock()
+        self._runtime_stats = {
+            "resident_hits": 0,
+            "resident_misses": 0,
+            "prediction_hits": 0,
+            "prediction_total": 0,
+            "sync_ssd_loads": 0,
+            "on_demand_load_time_s": 0.0,
+        }
 
     def setup(self, warm_expert_ids: Optional[List[int]] = None):
         self.store.offload_all_to_ssd()
@@ -58,8 +68,29 @@ class ChronosMLXInferenceEngine:
 
     def _install_runtime_hooks(self):
         def loader(eid: int) -> bool:
-            self.store.prefetch_to_ram([int(eid)])
-            return self.store.promote_to_vram(int(eid))
+            eid = int(eid)
+            was_hot = eid in self.store.hot_expert_ids()
+            with self.store._lock:
+                was_warm = (
+                    eid in self.store._warm
+                    and self.store._layer_states_complete(self.store._warm.get(eid))
+                )
+            t0 = time.monotonic()
+            if not was_hot and not was_warm:
+                with self._stats_lock:
+                    self._runtime_stats["sync_ssd_loads"] += 1
+            ok = self.store.promote_to_vram(eid)
+            elapsed = time.monotonic() - t0
+            with self._stats_lock:
+                self._runtime_stats["on_demand_load_time_s"] += elapsed
+                if ok:
+                    self._runtime_stats["resident_hits" if (was_hot or was_warm) else "resident_misses"] += 1
+                else:
+                    self._runtime_stats["resident_misses"] += 1
+                self._runtime_stats["prediction_total"] += 1
+                if eid in self._last_predicted:
+                    self._runtime_stats["prediction_hits"] += 1
+            return ok
 
         def touch(eid: int) -> None:
             with self.store._lock:
@@ -95,6 +126,12 @@ class ChronosMLXInferenceEngine:
 
     def stop(self):
         self._stop.set()
+        try:
+            self._prefetch_q.put_nowait([])
+        except queue.Full:
+            pass
+        if self._prefetch_thread.is_alive():
+            self._prefetch_thread.join(timeout=2.0)
 
     # ── Generation loop ───────────────────────────────────────────
 
@@ -115,6 +152,16 @@ class ChronosMLXInferenceEngine:
         """
         t0 = time.monotonic()
         setup_mem = self._memory_snapshot()
+        self._last_predicted = set()
+        with self._stats_lock:
+            self._runtime_stats = {
+                "resident_hits": 0,
+                "resident_misses": 0,
+                "prediction_hits": 0,
+                "prediction_total": 0,
+                "sync_ssd_loads": 0,
+                "on_demand_load_time_s": 0.0,
+            }
         self._install_runtime_hooks()
         # ── Prefill phase: front-load expert IO ───────────────────────────
         if scheduler is not None:
@@ -148,6 +195,7 @@ class ChronosMLXInferenceEngine:
                 # LookaheadRouter-driven prefetch
                 if lookahead_probs is not None:
                     future_ids = self._predict_future_experts(lookahead_probs)
+                    self._last_predicted = set(int(eid) for eid in future_ids)
                     self._schedule_prefetch(future_ids)
                     self._promote_ready(future_ids)
                 avail_masks = self._build_avail_masks(next_token)
@@ -181,15 +229,26 @@ class ChronosMLXInferenceEngine:
             **self._memory_fields(setup_mem, "after_setup"),
             **self._memory_fields(prefill_mem, "after_prefill"),
             **self._memory_fields(end_mem, "after_decode"),
+            **self._runtime_stat_fields(),
             **self.store.stats(),
         }
 
     def _predict_future_experts(self, lookahead_probs: mx.array) -> List[int]:
-        """Extract top-1 expert IDs for t+1 and t+2 from lookahead probs."""
+        """Extract bounded top-k expert IDs for future steps."""
         # lookahead_probs: [B, S, K+1, E] — take last token, steps 1..K
         future = lookahead_probs[0, -1, 1:, :]         # [K, E]
-        top_ids = mx.argmax(future, axis=-1).tolist()   # [K]
-        return list(set(top_ids))
+        top_k = max(1, min(
+            int(getattr(self.config, "num_experts_per_tok", 1) or 1),
+            int(getattr(self.config, "num_experts", future.shape[-1]) or future.shape[-1]),
+        ))
+        ids: list[int] = []
+        for k in range(future.shape[0]):
+            step = future[k]
+            if top_k == 1:
+                ids.append(int(mx.argmax(step).item()))
+            else:
+                ids.extend(int(v) for v in mx.argpartition(-step, kth=top_k - 1, axis=-1)[:top_k].tolist())
+        return list(dict.fromkeys(ids))
 
     def _build_avail_masks(self, _token) -> List[set[int]] | None:
         """Promote prefetched experts and return per-layer availability masks."""
@@ -201,7 +260,33 @@ class ChronosMLXInferenceEngine:
 
     def _promote_ready(self, expert_ids: List[int]) -> None:
         for eid in expert_ids:
-            self.store.promote_to_vram(int(eid))
+            eid = int(eid)
+            with self.store._lock:
+                ready = (
+                    eid in self.store._warm
+                    and self.store._layer_states_complete(self.store._warm.get(eid))
+                ) or eid in self.store._hot_lru
+            if ready:
+                self.store.promote_to_vram(eid)
+
+    def _runtime_stat_fields(self) -> dict:
+        with self._stats_lock:
+            stats = dict(self._runtime_stats)
+        total = int(stats.get("resident_hits", 0)) + int(stats.get("resident_misses", 0))
+        pred_total = int(stats.get("prediction_total", 0))
+        return {
+            "resident_hit_rate": round(float(stats.get("resident_hits", 0)) / max(total, 1), 4),
+            "cache_hit_rate": round(float(stats.get("resident_hits", 0)) / max(total, 1), 4),
+            "cache_hits": int(stats.get("resident_hits", 0)),
+            "cache_misses": int(stats.get("resident_misses", 0)),
+            "prediction_hit_rate": round(float(stats.get("prediction_hits", 0)) / max(pred_total, 1), 4),
+            "prediction_hits": int(stats.get("prediction_hits", 0)),
+            "prediction_total": pred_total,
+            "sync_ssd_loads": int(stats.get("sync_ssd_loads", 0)),
+            "on_demand_loads": int(stats.get("resident_misses", 0)),
+            "on_demand_load_time_s": round(float(stats.get("on_demand_load_time_s", 0.0)), 4),
+            "fallback_weight_rate": 0.0,
+        }
 
     @staticmethod
     def _sample(logits: mx.array, temperature: float, top_p: float) -> mx.array:
