@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Project_Chronos"
-version = "0.2.0"
+version = "0.2.1"
 description = "On-device low-latency lookahead dual-layer MoE inference — Lookahead Routing + Async Prefetch + Hybrid Attention"
 readme = "README.md"
 license = "Apache-2.0"
