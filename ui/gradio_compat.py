@@ -52,11 +52,13 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in slim CI
         Blocks=_Component,
         Button=_Component,
         Checkbox=_Component,
+        CheckboxGroup=_Component,
         Column=_Component,
         Dropdown=_Component,
         File=_Component,
         HTML=_Component,
         JSON=_Component,
+        LinePlot=_Component,
         Markdown=_Component,
         Number=_Component,
         Plot=_Component,
@@ -69,4 +71,3 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in slim CI
         Timer=_Component,
         update=_update,
     )
-

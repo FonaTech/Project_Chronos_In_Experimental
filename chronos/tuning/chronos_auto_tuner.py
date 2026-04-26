@@ -126,6 +126,11 @@ class ChronosAutoTuner(AutoTuner):
         from chronos.backend import resolve_training_device
         from chronos.model.config import ChronosConfig
         from chronos.model.model_chronos import ChronosForCausalLM
+        from chronos.model.checkpoint import (
+            chronos_config_from_checkpoint,
+            load_checkpoint_state_dict,
+            load_state_dict_controlled,
+        )
         from chronos.model.temporal_loss import total_loss
         from chronos.model.moe_chronos import ChronosMOEFeedForward
 
@@ -139,23 +144,48 @@ class ChronosAutoTuner(AutoTuner):
         ns = int(params.get("num_shared_experts", 1))
         kv = int(params.get("kv_latent_dim", 64))
 
-        cfg = ChronosConfig(
-            hidden_size=hs,
-            num_hidden_layers=4,
-            num_experts=ne,
-            num_shared_experts=ns,
-            kv_latent_dim=kv,
-            lookahead_steps=la,
-            lambda_balance=lb,
-            lambda_temporal=lt,
-            use_hybrid_attention=True,
-            use_moe=True,
-        )
+        if os.path.exists(model_id):
+            try:
+                cfg, _sources = chronos_config_from_checkpoint(
+                    model_id,
+                    overrides={
+                        "hidden_size": hs,
+                        "num_experts": ne,
+                        "num_shared_experts": ns,
+                        "kv_latent_dim": kv,
+                        "lookahead_steps": la,
+                        "lambda_balance": lb,
+                        "lambda_temporal": lt,
+                    },
+                    require_unsniffable=True,
+                )
+            except Exception:
+                cfg = ChronosConfig(
+                    hidden_size=hs, num_hidden_layers=4, num_experts=ne,
+                    num_experts_per_tok=2, num_shared_experts=ns,
+                    kv_latent_dim=kv, lookahead_steps=la,
+                    lambda_balance=lb, lambda_temporal=lt,
+                    use_hybrid_attention=True, use_moe=True,
+                )
+        else:
+            cfg = ChronosConfig(
+                hidden_size=hs,
+                num_hidden_layers=4,
+                num_experts=ne,
+                num_experts_per_tok=2,
+                num_shared_experts=ns,
+                kv_latent_dim=kv,
+                lookahead_steps=la,
+                lambda_balance=lb,
+                lambda_temporal=lt,
+                use_hybrid_attention=True,
+                use_moe=True,
+            )
         model = ChronosForCausalLM(cfg).to(device)
         if os.path.exists(model_id):
             try:
-                w = torch.load(model_id, map_location="cpu")
-                model.load_state_dict(w, strict=False)
+                w = load_checkpoint_state_dict(model_id, map_location="cpu")
+                load_state_dict_controlled(model, w)
             except Exception:
                 pass
 
@@ -197,7 +227,11 @@ class ChronosAutoTuner(AutoTuner):
         patch = self.get_best_config_patch()
         if self.result and self.result.best_params:
             p = self.result.best_params
-            for key in ("lambda_balance", "lambda_temporal", "lookahead_steps"):
+            for key in (
+                "lambda_balance", "lambda_temporal", "lambda_lookahead",
+                "lookahead_steps", "hidden_size", "num_experts",
+                "num_shared_experts", "kv_latent_dim",
+            ):
                 if key in p:
                     patch[key] = p[key]
         return patch

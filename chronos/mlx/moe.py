@@ -23,6 +23,13 @@ class FeedForwardMLX(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class LazyFeedForwardMLX(nn.Module):
+    """Placeholder for an expert whose weights are not resident in MLX memory."""
+
+    def __call__(self, _x: mx.array) -> mx.array:
+        raise RuntimeError("MLX lazy expert placeholder executed before materialization")
+
+
 class ChronosMLXMOE(nn.Module):
     """
     MLX-native Mixture-of-Experts with:
@@ -44,7 +51,18 @@ class ChronosMLXMOE(nn.Module):
         self.shared_experts = [
             FeedForwardMLX(H, I) for _ in range(config.num_shared_experts)
         ]
-        self.last_router_probs = None  # [B, S, E] stored after each forward
+        object.__setattr__(self, "_last_router_probs", None)  # [B, S, E]
+        self.runtime_miss_policy = "sync_on_demand"
+        self.runtime_on_demand_loader = None
+        self.runtime_touch_expert = None
+
+    @property
+    def last_router_probs(self):
+        return self._last_router_probs
+
+    @last_router_probs.setter
+    def last_router_probs(self, value):
+        object.__setattr__(self, "_last_router_probs", value)
 
     def _shared_out(self, x: mx.array) -> mx.array:
         return sum(e(x) for e in self.shared_experts) / len(self.shared_experts)
@@ -62,8 +80,8 @@ class ChronosMLXMOE(nn.Module):
         B, S, H = x.shape
         x_flat = x.reshape(-1, H)                        # [N, H]
 
-        scores = mx.softmax(self.gate(x_flat), axis=-1)  # [N, E]
-        self.last_router_probs = scores.reshape(B, S, self.num_experts)
+        scores = mx.softmax(self.gate(x_flat).astype(mx.float32), axis=-1)  # [N, E]
+        object.__setattr__(self, "_last_router_probs", scores.reshape(B, S, self.num_experts))
 
         # top-k routing
         topk_idx = mx.argpartition(-scores, kth=self.num_experts_per_tok - 1, axis=-1)
@@ -83,9 +101,16 @@ class ChronosMLXMOE(nn.Module):
                 w = mx.where(sel, topk_weight, 0.0).sum(axis=-1, keepdims=True)  # [N, 1]
                 contrib = expert(x_flat) * w * tok_mask[:, None]
                 y = y + contrib
+            if len(self.shared_experts) > 0:
+                y = y + self._shared_out(x_flat)
         else:
             # Inference: compile-safe soft gating
-            avail = available_expert_mask.astype(x_flat.dtype)  # [E] float
+            python_avail = None
+            if isinstance(available_expert_mask, (set, list, tuple)):
+                python_avail = set(int(v) for v in available_expert_mask)
+                avail = None
+            else:
+                avail = available_expert_mask.astype(x_flat.dtype)  # [E] float
             shared_out = self._shared_out(x_flat)               # [N, H]
 
             for i, expert in enumerate(self.experts):
@@ -93,10 +118,49 @@ class ChronosMLXMOE(nn.Module):
                 tok_mask = sel.any(axis=-1)
                 w = mx.where(sel, topk_weight, 0.0).sum(axis=-1, keepdims=True)
 
-                expert_out  = expert(x_flat)
-                # avail[i]==1 → expert; avail[i]==0 → shared fallback
-                blended = avail[i] * expert_out + (1.0 - avail[i]) * shared_out
+                if python_avail is not None:
+                    selected = bool(mx.any(tok_mask).item())
+                    is_avail = i in python_avail
+                    if selected and not is_avail:
+                        loader = getattr(self, "runtime_on_demand_loader", None)
+                        if loader is not None and getattr(self, "runtime_miss_policy", "") == "sync_on_demand":
+                            is_avail = bool(loader(int(i)))
+                    if is_avail:
+                        if isinstance(self.experts[i], LazyFeedForwardMLX):
+                            loader = getattr(self, "runtime_on_demand_loader", None)
+                            if selected and loader is not None and getattr(self, "runtime_miss_policy", "") == "sync_on_demand":
+                                is_avail = bool(loader(int(i)))
+                        if isinstance(self.experts[i], LazyFeedForwardMLX):
+                            if selected and getattr(self, "runtime_miss_policy", "") == "sync_on_demand":
+                                raise RuntimeError(
+                                    f"MLX lazy expert {i} was selected but not materialized"
+                                )
+                            blended = shared_out
+                        else:
+                            touch = getattr(self, "runtime_touch_expert", None)
+                            if touch is not None:
+                                touch(int(i))
+                            expert_out = self.experts[i](x_flat)
+                            blended = expert_out
+                    else:
+                        if selected and getattr(self, "runtime_miss_policy", "") == "sync_on_demand":
+                            raise RuntimeError(
+                                f"MLX lazy expert {i} could not be loaded on demand"
+                            )
+                        blended = shared_out
+                else:
+                    if isinstance(expert, LazyFeedForwardMLX):
+                        raise RuntimeError(
+                            "MLX lazy expert placeholder received a tensor mask. "
+                            "Use Python set masks for lazy/offload inference so "
+                            "selected experts can be materialized before execution."
+                        )
+                    expert_out  = expert(x_flat)
+                    # avail[i]==1 → expert; avail[i]==0 → shared fallback
+                    blended = avail[i] * expert_out + (1.0 - avail[i]) * shared_out
                 contrib = blended * w * tok_mask[:, None]
                 y = y + contrib
+            if len(self.shared_experts) > 0:
+                y = y + shared_out
 
         return y.reshape(B, S, H)

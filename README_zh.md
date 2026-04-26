@@ -2,7 +2,7 @@
 
 **一套从架构层原生支持 SSD+DRAM 混合加载推理的 MoE 框架，配套完整的 6 阶段训练链路。**
 
-[![PyPI](https://img.shields.io/pypi/v/project-chronos)](https://pypi.org/project/project-chronos/)
+[![PyPI](https://img.shields.io/pypi/v/Project_Chronos)](https://pypi.org/project/Project_Chronos/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 
@@ -98,7 +98,7 @@ flowchart TB
 output = avail[i] * expert_output + (1.0 - avail[i]) * shared_expert_output
 ```
 
-共享专家（常驻 VRAM）按比例混入，生成流**从不中断**，精度平滑降级，专家后台加载完毕后自动恢复。
+共享专家常驻；在 exact lazy/offload 对比模式下，Chronos 只会同步物化当前被路由选中的缺失专家，并按 LRU 卸载低热度专家以守住 resident budget，不会静默全量加载所有专家。只有显式启用 fallback 模式时，质量才会按共享专家路径平滑降级。
 
 ---
 
@@ -181,6 +181,14 @@ flowchart LR
 | 5 GRPO      | `train_chronos_grpo.py`    | PG·A − β·KL（含 ToyReward / 可插 LMRewardModel）| 0.10 |
 | 6 Distill   | `train_chronos_distill.py` | α·T²·KL(s‖t) + (1−α)·CE             | 0.05 |
 
+训练精度与资源策略：
+
+- 默认 `--dtype auto`。MPS/MLX 训练优先解析为 BF16 以保证稳定性，CUDA/XPU 解析为 FP16；CPU 默认 FP32，只有显式传 `--dtype float16` 或 `--dtype bfloat16` 才启用 CPU autocast。
+- CPU 训练默认使用物理核心；可用 `--cpu_threads` 或 `--cpu_budget_percent` 覆盖。
+- macOS 上 MPS/MLX 训练默认强制 DataLoader workers 为 `0`，避免 multiprocessing 触发 Metal command-buffer 崩溃。CPU/CUDA 仍可使用 worker 进程；高级用户可用 `CHRONOS_ALLOW_METAL_DATALOADER_WORKERS=1` 覆盖这个保护。
+- MLX 原生训练会按 `log_interval` 同步 UI 日志、标量读数和图表点；Web UI Stop 会在每个 batch 边界检查并停止。
+- Web UI 每阶段保存后会写出 warning-only 的 `<checkpoint>.verify.json`，检查 no-mask vs all-available MoE 等价性，并在 Apple Silicon 上对比 MLX prefill logits 与 PyTorch CPU baseline。
+
 完整 6 阶段端到端对比见 `tools/compare_minimind_chronos_v3.py`。
 
 ---
@@ -212,6 +220,7 @@ d.describe()       # 人类可读的能力总览
 - **一等公民（训练 + 推理）**：`cpu`、`mps`、`cuda`、`mlx`
 - **推理仅 / 实验性**：`vulkan`（仅当 PyTorch `USE_VULKAN=ON` 自定义构建时存在）
 - **第三方插件钩子**：`opencl`（替换 `chronos/backend/ext/opencl.py:PROBE()`）
+- **Apple Silicon 策略**：推理 auto 仍优先 MLX；训练会走原生 `chronos.mlx.*` 路径，不会把 PyTorch 模型错误地 `.to("mlx")`。
 
 诚实声明：上游 PyTorch 没有 OpenCL 后端、Vulkan 也仅在自定义构建中可用。Chronos 提供 dispatcher 接缝，使第三方插件无需改核心代码即可接入。
 
@@ -296,7 +305,7 @@ D_{\mathrm{KL}}
 ## 安装  (Not Ready in PyPI Yet)
 
 ```bash
-pip install project-chronos
+pip install Project_Chronos
 ```
 
 或从源码：
@@ -309,7 +318,7 @@ pip install -e ".[dev]"
 
 **MLX（Apple Silicon）：**
 ```bash
-pip install "project-chronos[mlx]"
+pip install "Project_Chronos[mlx]"
 ```
 
 **vLLM 服务（可选，仅 Linux+CUDA）：**
@@ -327,7 +336,7 @@ pip install vllm
 
 ## 快速开始
 
-### Web UI（M6 — 7 个 Tab，4 种语言）
+### Web UI（M6 — 8 个 Tab，4 种语言）
 
 ```bash
 chronos-ui
@@ -335,7 +344,25 @@ chronos-ui
 python chronos_app.py
 ```
 
-包含：⚙️ Config（含右侧实时参数估算面板，合并了 Designer）/ 🏋️ Train（拥有 data_path）/ 🧪 6-Stage Pipeline（每阶段独立数据路径）/ 💬 Inference / 📊 Benchmark（Markdown 表 + BarPlot）/ 🔬 Auto-Tune（持久化日志 + 一键 Apply Best → Config）/ 📡 IO Monitor。i18n 支持 zh-Hans / zh-Hant / en / ja。
+包含：⚙️ Config（含右侧实时参数估算面板，合并了 Designer）/ 🏋️ Train（拥有 data_path）/ 🧪 6-Stage Pipeline（每阶段独立数据路径）/ 💬 Inference（含懒加载 vs 全量 DRAM 对比）/ 📦 Export（FP16/Q8_0 safetensors 与 GGUF）/ 📊 Benchmark（Markdown 表 + BarPlot）/ 🔬 Auto-Tune（持久化日志 + 一键 Apply Best → Config）/ 📡 IO Monitor。i18n 支持 zh-Hans / zh-Hant / en / ja。
+
+### 部署导出
+
+```bash
+chronos export \
+    --model_path ./out/sft_384_moe.pth \
+    --output_dir ./exports/sft_384 \
+    --formats fp16-safetensors q8_0-safetensors fp16-gguf q8_0-gguf
+```
+
+导出产物包含 `config.json`、`chronos_export_manifest.json`，并写入 MoE
+top-k、共享 fallback expert、lookahead router、混合注意力、可选专家缓存布局等
+Chronos 元数据。Chronos 原生 loader 可以从导出的 `safetensors` / `GGUF`
+产物直接走懒加载专家链路。
+
+兼容性说明：GGUF 使用 `general.architecture=chronos`。未实现 Chronos
+architecture 的 stock Ollama/llama.cpp 不能正确执行该模型；Chronos 不是
+LLaMA tensor layout 的简单改名。
 
 ### Stage 1：预训练
 
@@ -364,6 +391,28 @@ python train_chronos_distill.py \
     --teacher_path ./out/sft_192_moe.pth \
     --from_weight grpo --save_dir ./out --device cpu \
     --alpha 0.7 --temperature 4.0
+```
+
+### Checkpoint 与 offload 诊断
+
+新的 `.pth` checkpoint 会同步写出同名 `*.config.json`，保存无法从权重形状反推的 MoE 拓扑字段，例如 `num_experts_per_tok`。诊断命令会检查 chat template 生成、`no_mask` vs `all_available` masked drift、全冷 shared fallback、LookaheadRouter 预测质量，以及 SSD/RAM/VRAM offload 统计。
+
+```bash
+python diagnose_checkpoint.py \
+    --model_path ./out/sft_384_moe.pth \
+    --config_path ./chronos_config.json \
+    --sft_data ../Dataset/sft_t2t.jsonl \
+    --mlx_parity \
+    --device cpu
+
+# 或使用统一 CLI：
+chronos diagnose --model_path ./out/sft_384_moe.pth --config_path ./chronos_config.json
+```
+
+后端速度与 dtype sanity check：
+
+```bash
+python benchmark_training_backends.py --backends cpu mps mlx --dtypes auto bfloat16 float16 --steps 2
 ```
 
 ### 端到端对比（minimind vs Chronos）

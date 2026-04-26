@@ -206,6 +206,8 @@ class PrefetchScheduler:
         if lookahead_probs is None:
             return []
         import torch
+        top_k = int(getattr(self.store.config, "num_experts_per_tok", 1) or 1)
+        top_k = max(1, min(top_k, lookahead_probs.shape[-1]))
         # lookahead_probs: [B, S, K+1, E] — take last token, steps 1..K.
         # We submit t+1 first (highest priority), then t+2, etc., so the
         # FIFO queue naturally orders them by recency.
@@ -213,7 +215,8 @@ class PrefetchScheduler:
         K = last_token_probs.shape[1]
         all_submitted: List[int] = []
         for k in range(K):
-            ids_k = last_token_probs[:, k, :].argmax(dim=-1).unique().cpu().tolist()
+            ids_k = torch.topk(last_token_probs[:, k, :], k=top_k, dim=-1).indices
+            ids_k = ids_k.reshape(-1).unique().cpu().tolist()
             if ids_k:
                 self.prefetcher.submit(ids_k)
                 all_submitted.extend(ids_k)

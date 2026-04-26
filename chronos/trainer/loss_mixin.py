@@ -29,6 +29,7 @@ from chronos.model.moe_chronos import ChronosMOEFeedForward
 from chronos.model.temporal_loss import (
     temporal_locality_loss,
     lookahead_supervision_loss,
+    lookahead_topk_hit_loss,
 )
 
 
@@ -115,6 +116,15 @@ def chronos_loss_term(
             teacher = router_mean.detach()
             la = lookahead_supervision_loss(lookahead_probs, teacher, lookahead_steps)
             loss = loss + lambda_lookahead * la
+            lambda_lookahead_topk = float(getattr(config, "lambda_lookahead_topk", 0.0))
+            if lambda_lookahead_topk > 0.0:
+                topk_loss = lookahead_topk_hit_loss(
+                    lookahead_probs,
+                    teacher,
+                    lookahead_steps,
+                    int(getattr(config, "num_experts_per_tok", 1) or 1),
+                )
+                loss = loss + lambda_lookahead_topk * topk_loss
     return loss
 
 

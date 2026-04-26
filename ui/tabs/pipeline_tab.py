@@ -34,7 +34,7 @@ STAGES = [
     ("Distill",  "train_chronos_distill.py", "grpo",   "tests/fixtures/tiny_sft.jsonl",      True),
 ]
 
-PIPELINE_TRAIN_BACKEND_CHOICES = ["auto"] + [name for name in ("cuda", "xpu", "mps", "cpu") if name in set(training_available())]
+PIPELINE_TRAIN_BACKEND_CHOICES = ["auto"] + [name for name in ("cuda", "xpu", "mlx", "mps", "cpu") if name in set(training_available())]
 
 
 def build_pipeline_tab():
@@ -88,12 +88,12 @@ def build_pipeline_tab():
             takes_teacher = row["takes_teacher"]
 
             def run(_save_dir, _steps, _backend, _data, _teacher, current_log):
-                _, resolved_device = resolve_training_device(_backend)
+                selected_backend, resolved_device = resolve_training_device(_backend)
                 cmd = [sys.executable, script,    # relative — resolved against cwd
                        "--data_path", _data,
                        "--save_dir", _save_dir,
                        "--steps", str(int(_steps)),
-                       "--device", resolved_device]
+                       "--device", selected_backend if selected_backend == "mlx" else resolved_device]
                 if from_w:
                     cmd += ["--from_weight", from_w]
                 if takes_teacher:

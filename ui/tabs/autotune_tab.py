@@ -20,6 +20,7 @@ from ui.gradio_compat import gr
 
 import chronos.deps  # noqa: F401
 from ui.i18n import t, register_translatable
+from ui.presets import CONFIG_INPUT_ORDER
 from chronos.tuning.chronos_auto_tuner import ChronosAutoTuner, ChronosSearchSpaceConfig
 
 
@@ -52,24 +53,8 @@ def _append_trial(record: dict):
         f.write(json.dumps(record) + "\n")
 
 
-# Map best-params keys to indices into the Config tab's all_inputs list.
-# IMPORTANT: must stay in sync with ui/tabs/config_tab.py:all_inputs order.
-PARAM_TO_CONFIG_IDX = {
-    "hidden_size":          0,
-    "num_hidden_layers":    1,
-    "num_experts":          2,
-    "num_experts_per_tok":  3,
-    "num_shared_experts":   4,
-    "lookahead_steps":      5,
-    "kv_latent_dim":        6,
-    "sliding_window_size":  7,
-    "lambda_balance":       15,
-    "lambda_temporal":      16,
-    "lambda_lookahead":     17,
-    "lambda_router_anchor": 18,
-    "learning_rate":        23,
-    "batch_size":           24,
-}
+# Map best-param keys to Config tab widgets using the shared input order.
+PARAM_TO_CONFIG_IDX = {key: idx for idx, key in enumerate(CONFIG_INPUT_ORDER)}
 
 
 def build_autotune_tab(config_state: gr.State, config_inputs: list):

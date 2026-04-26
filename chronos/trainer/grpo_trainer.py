@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import os
 import time
-from contextlib import nullcontext
 from copy import deepcopy
 from typing import Callable, List, Tuple
 
@@ -44,6 +43,15 @@ from chronos.trainer.loss_mixin import (
     collect_router_probs,
     router_kl_anchor,
     capture_reference_routing,
+)
+from chronos.model.checkpoint import save_state_dict_with_config
+from chronos.trainer.device_utils import (
+    autocast_context,
+    configure_cpu_threads,
+    dataloader_kwargs,
+    grad_scaler,
+    optimizer_step_with_scaler,
+    runtime_summary,
 )
 
 
@@ -87,11 +95,18 @@ class ChronosGRPOTrainer:
         self.temperature = float(getattr(args, "temperature", 1.0))
         self.reward_fn = reward_fn or default_reward
 
-        device_type = "cuda" if "cuda" in str(self.device) else "cpu"
-        dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-        self.autocast_ctx = nullcontext() if device_type == "cpu" \
-            else torch.cuda.amp.autocast(dtype=dtype)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
+        configure_cpu_threads(
+            getattr(args, "cpu_threads", None),
+            budget_percent=getattr(args, "cpu_budget_percent", 100),
+        )
+        self.autocast_ctx = autocast_context(self.device, getattr(args, "dtype", "float32"))
+        self.scaler = grad_scaler(self.device, getattr(args, "dtype", "float32"))
+        summary = runtime_summary(self.device, getattr(args, "dtype", "float32"))
+        Logger(
+            "Runtime: "
+            f"device={summary.device} type={summary.device_type} dtype={summary.dtype} "
+            f"cpu_threads={summary.cpu_threads} autocast={summary.autocast} scaler={summary.scaler}"
+        )
         from chronos.trainer.optim_utils import build_optimizer
         self.optimizer = build_optimizer(
             model, lr=args.learning_rate,
@@ -230,11 +245,12 @@ class ChronosGRPOTrainer:
 
         self.scaler.scale(loss).backward()
         if step % self.args.accumulation_steps == 0:
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)
+            optimizer_step_with_scaler(
+                self.scaler,
+                self.optimizer,
+                self.model.parameters(),
+                self.args.grad_clip,
+            )
 
         return {
             "loss": float(loss.item() * self.args.accumulation_steps),
@@ -267,8 +283,7 @@ class ChronosGRPOTrainer:
         os.makedirs(self.args.save_dir, exist_ok=True)
         ckp = os.path.join(self.args.save_dir, f"grpo_{self.config.hidden_size}_moe.pth")
         self.model.eval()
-        state = self.model.state_dict()
-        torch.save({k: v.half().cpu() for k, v in state.items()}, ckp)
+        save_state_dict_with_config(self.model, ckp, self.config, stage="grpo")
         self.model.train()
 
 

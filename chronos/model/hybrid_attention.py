@@ -25,6 +25,38 @@ from model.model_minimind import RMSNorm, apply_rotary_pos_emb, repeat_kv
 from .config import ChronosConfig
 
 
+def _key_padding_bias(attention_mask: torch.Tensor, key_len: int, dtype: torch.dtype) -> torch.Tensor:
+    """Return an additive key-padding bias broadcastable to [B, H, S, T].
+
+    Chronos callers pass the tokenizer-style 2-D mask [B, total_seq_len].
+    Cached decoding and sliding-window layers only attend to the final
+    ``key_len`` positions, so slice from the right before broadcasting.
+    """
+    if attention_mask.dim() == 2:
+        if attention_mask.shape[-1] < key_len:
+            pad = attention_mask.new_ones(attention_mask.shape[0], key_len - attention_mask.shape[-1])
+            attention_mask = torch.cat([pad, attention_mask], dim=-1)
+        keep = attention_mask[:, -key_len:].to(dtype=dtype)
+        return (1.0 - keep)[:, None, None, :] * -1e9
+
+    if attention_mask.dim() == 3:
+        keep = attention_mask[:, :, -key_len:].to(dtype=dtype)
+        return (1.0 - keep)[:, None, :, :] * -1e9
+
+    if attention_mask.dim() == 4:
+        if attention_mask.shape[-1] < key_len:
+            pad_shape = list(attention_mask.shape)
+            pad_shape[-1] = key_len - attention_mask.shape[-1]
+            pad = attention_mask.new_ones(pad_shape)
+            attention_mask = torch.cat([pad, attention_mask], dim=-1)
+        mask = attention_mask[..., -key_len:].to(dtype=dtype)
+        if mask.min() < 0:
+            return mask
+        return (1.0 - mask) * -1e9
+
+    raise ValueError(f"attention_mask must be 2-D, 3-D, or 4-D, got shape {tuple(attention_mask.shape)}")
+
+
 # ── MLA: Multi-head Latent Attention ─────────────────────────────
 
 class MLAAttention(nn.Module):
@@ -140,7 +172,7 @@ class MLAAttention(nn.Module):
             scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
             scores[:, :, :, -S:] += torch.full((S, S), float('-inf'), device=scores.device).triu(1)
             if attention_mask is not None:
-                scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+                scores += _key_padding_bias(attention_mask, T, scores.dtype)
             out = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(q)) @ v
 
         out = out.transpose(1, 2).reshape(B, S, -1)
@@ -219,7 +251,7 @@ class SlidingWindowAttention(nn.Module):
             if T == S:
                 scores[:, :, :, -S:] += torch.full((S, S), float('-inf'), device=scores.device).triu(1)
             if attention_mask is not None:
-                scores += (1.0 - attention_mask[:, :, :, -T:].unsqueeze(1)) * -1e9
+                scores += _key_padding_bias(attention_mask, T, scores.dtype)
             out = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
 
         out = out.transpose(1, 2).reshape(B, S, -1)

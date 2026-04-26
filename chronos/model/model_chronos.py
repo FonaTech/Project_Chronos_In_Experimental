@@ -90,6 +90,25 @@ class ChronosModel(nn.Module):
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
+    def _ensure_rope_cache(self, needed_len: int, device: torch.device) -> None:
+        """Grow RoPE buffers when generation exceeds the checkpoint context."""
+        current_len = int(self.freqs_cos.shape[0])
+        if needed_len <= current_len and self.freqs_cos.device == device:
+            return
+        target_len = max(needed_len, current_len * 2, int(self.config.max_position_embeddings))
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim=self.config.head_dim,
+            end=target_len,
+            rope_base=self.config.rope_theta,
+            rope_scaling=self.config.rope_scaling,
+        )
+        self.freqs_cos = freqs_cos.to(device=device)
+        self.freqs_sin = freqs_sin.to(device=device)
+        self.config.max_position_embeddings = max(
+            int(self.config.max_position_embeddings),
+            target_len,
+        )
+
     def forward(
         self,
         input_ids,
@@ -110,6 +129,7 @@ class ChronosModel(nn.Module):
             if pkv is not None:
                 start_pos = pkv[0].shape[1]
                 break
+        self._ensure_rope_cache(start_pos + S, input_ids.device)
 
         hidden_states = self.dropout(self.embed_tokens(input_ids))
         # Pass full freqs so hybrid attention layers can slice as needed

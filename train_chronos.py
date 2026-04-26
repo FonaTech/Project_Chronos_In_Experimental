@@ -15,15 +15,16 @@ import sys
 import chronos.deps  # ensure minimind on sys.path
 
 import argparse
-import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from chronos.backend import resolve_training_device
 from trainer.trainer_utils import setup_seed, Logger
-from dataset.lm_dataset import PretrainDataset
-from chronos.model.config import ChronosConfig
+from chronos.data.flexible_dataset import FlexibleDataset as PretrainDataset
 from chronos.trainer.chronos_trainer import ChronosTrainer
+from chronos.trainer.stage_utils import add_topology_args, build_pretrain_config
+from chronos.model.checkpoint import save_state_dict_with_config
+from chronos.trainer.device_utils import configure_cpu_threads, dataloader_kwargs, runtime_summary
 
 
 def parse_args():
@@ -34,23 +35,23 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--learning_rate", type=float, default=5e-4)
     p.add_argument("--device", type=str, default="auto")
-    p.add_argument("--dtype", type=str, default="bfloat16")
+    p.add_argument("--dtype", type=str, default="auto")
     p.add_argument("--accumulation_steps", type=int, default=8)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--log_interval", type=int, default=100)
     p.add_argument("--save_interval", type=int, default=1000)
     p.add_argument("--max_seq_len", type=int, default=512)
-    p.add_argument("--num_workers", type=int, default=4)
-    # Model
-    p.add_argument("--hidden_size", type=int, default=512)
-    p.add_argument("--num_hidden_layers", type=int, default=8)
-    p.add_argument("--num_experts", type=int, default=4)
-    p.add_argument("--num_experts_per_tok", type=int, default=1)
-    p.add_argument("--num_shared_experts", type=int, default=1)
-    p.add_argument("--lookahead_steps", type=int, default=2)
+    p.add_argument("--num_workers", default="auto")
+    p.add_argument("--cpu_threads", default="auto")
+    p.add_argument("--cpu_budget_percent", default=100, type=float)
+    add_topology_args(p, defaults=True)
     # Loss coefficients
     p.add_argument("--lambda_balance", type=float, default=5e-4)
     p.add_argument("--lambda_temporal", type=float, default=1e-3)
+    p.add_argument("--lambda_lookahead", type=float, default=0.1)
+    p.add_argument("--lambda_lookahead_topk", type=float, default=0.05)
+    p.add_argument("--fallback_mask_prob", type=float, default=0.0,
+                   help="Randomly mask routed experts during training to teach the shared offload fallback.")
     # VRAM budget
     p.add_argument("--vram_budget_gb", type=float, default=4.0)
     # Pipeline compat: accept but ignore args that other Stage scripts take.
@@ -66,29 +67,39 @@ def main():
     args = parse_args()
     selected_backend, resolved_device = resolve_training_device(args.device)
     args.device = resolved_device
+    threads = configure_cpu_threads(args.cpu_threads, budget_percent=args.cpu_budget_percent)
     setup_seed(42)
 
-    config = ChronosConfig(
-        hidden_size=args.hidden_size,
-        num_hidden_layers=args.num_hidden_layers,
-        num_experts=args.num_experts,
-        num_experts_per_tok=args.num_experts_per_tok,
-        num_shared_experts=args.num_shared_experts,
-        lookahead_steps=args.lookahead_steps,
-        lambda_balance=args.lambda_balance,
-        lambda_temporal=args.lambda_temporal,
-        vram_budget_gb=args.vram_budget_gb,
-        use_moe=True,
-    )
+    config = build_pretrain_config(args)
 
     tokenizer = AutoTokenizer.from_pretrained(
         chronos.deps.get_tokenizer_path()
     )
     dataset = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     loader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True,
+        dataset,
+        batch_size=args.batch_size,
+        **dataloader_kwargs(device=args.device, num_workers=args.num_workers, shuffle=True),
     )
+
+    if selected_backend == "mlx":
+        from chronos.mlx.training import run_mlx_stage
+
+        rt = runtime_summary(args.device, args.dtype)
+        Logger(
+            f"Training backend: {selected_backend}  device={args.device} "
+            f"dtype={rt.dtype} autocast={rt.autocast}"
+        )
+        Logger(f"CPU threads: {threads}  DataLoader workers: {loader.num_workers}")
+        run_mlx_stage(
+            stage="pretrain",
+            config=config,
+            checkpoint_path=None,
+            save_dir=args.save_dir,
+            loader=loader,
+            args=args,
+        )
+        return
 
     trainer = ChronosTrainer(config, args)
     total_params = sum(p.numel() for p in trainer.model.parameters()) / 1e6
@@ -96,7 +107,12 @@ def main():
            f"experts={config.num_experts} shared={config.num_shared_experts} "
            f"lookahead={config.lookahead_steps} "
            f"λ1={config.lambda_balance} λ2={config.lambda_temporal}")
-    Logger(f"Training backend: {selected_backend}  device={args.device}")
+    rt = runtime_summary(args.device, args.dtype)
+    Logger(
+        f"Training backend: {selected_backend}  device={args.device} "
+        f"dtype={rt.dtype} autocast={rt.autocast}"
+    )
+    Logger(f"CPU threads: {threads}  DataLoader workers: {loader.num_workers}")
 
     for epoch in range(args.epochs):
         iters = len(loader) if args.steps is None else min(int(args.steps), len(loader))
@@ -124,8 +140,7 @@ def main():
     import os
     os.makedirs(args.save_dir, exist_ok=True)
     ckp = os.path.join(args.save_dir, f"chronos_{config.hidden_size}_moe.pth")
-    state = trainer.model.state_dict()
-    torch.save({k: v.half().cpu() for k, v in state.items()}, ckp)
+    save_state_dict_with_config(trainer.model, ckp, config, stage="chronos")
     Logger(f"Saved → {ckp}")
 
 

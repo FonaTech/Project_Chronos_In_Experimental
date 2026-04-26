@@ -18,6 +18,21 @@ _pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _pkg_root not in sys.path:
     sys.path.insert(0, _pkg_root)
 
+from chronos.trainer.device_utils import (
+    configure_cpu_thread_env,
+    configure_cpu_threads,
+    cpu_thread_snapshot,
+)
+
+# Configure CPU thread pools before importing Gradio/UI modules that may pull
+# in numpy/torch-heavy dependencies. Training can still override this from the
+# Config tab, but the process starts from a multi-thread policy instead of a
+# shell-provided OMP_NUM_THREADS=1.
+_BOOT_CPU_THREADS = configure_cpu_thread_env(
+    os.environ.get("CHRONOS_UI_CPU_THREADS", "auto"),
+    budget_percent=os.environ.get("CHRONOS_CPU_BUDGET_PERCENT", 100),
+)
+
 from ui.gradio_compat import gr
 
 import chronos.deps  # auto-bootstrap minimind
@@ -28,6 +43,7 @@ from ui.i18n import (
 from ui.tabs.config_tab    import build_config_tab
 from ui.tabs.train_tab     import build_train_tab
 from ui.tabs.inference_tab import build_inference_tab
+from ui.tabs.export_tab    import build_export_tab
 from ui.tabs.benchmark_tab import build_benchmark_tab
 from ui.tabs.autotune_tab  import build_autotune_tab
 from ui.tabs.iomon_tab     import build_iomon_tab
@@ -85,6 +101,7 @@ def build_app() -> gr.Blocks:
         build_train_tab(config_state, cfg_save_dir)
         build_pipeline_tab()
         build_inference_tab(config_state)
+        build_export_tab()
         build_benchmark_tab()
         build_autotune_tab(config_state, config_inputs)
         build_iomon_tab()
@@ -107,7 +124,17 @@ def main():
     parser.add_argument("--port",  type=int,  default=7860)
     parser.add_argument("--host",  type=str,  default="127.0.0.1")
     parser.add_argument("--share", action="store_true")
+    parser.add_argument("--cpu-threads", default="auto",
+                        help="PyTorch/BLAS CPU threads for the WebUI process.")
+    parser.add_argument("--cpu-budget-percent", type=float, default=100,
+                        help="CPU physical-core budget used when --cpu-threads=auto.")
     args = parser.parse_args()
+
+    threads = configure_cpu_threads(args.cpu_threads, budget_percent=args.cpu_budget_percent)
+    print(
+        f"[Chronos UI] CPU threads configured: {threads} "
+        f"(boot={_BOOT_CPU_THREADS}); {cpu_thread_snapshot()}"
+    )
 
     app = build_app()
     app.launch(

@@ -39,12 +39,27 @@ class ChronosConfig(MiniMindConfig):
         self.cluster_manifest_path = kwargs.pop("cluster_manifest_path", None)
         # M2: weight on the lookahead supervision loss
         self.lambda_lookahead: float = kwargs.pop("lambda_lookahead", 0.1)
+        # Auxiliary hit-rate loss for the lookahead head. The soft CE above
+        # learns distribution shape; this term directly rewards future top-k
+        # expert-set recall, which is what offload prefetch needs.
+        self.lambda_lookahead_topk: float = kwargs.pop("lambda_lookahead_topk", 0.05)
         # M4: weight on the router KL anchor (alignment stages only).
         # Prevents SFT/DPO/ORPO/GRPO gradients from drifting routing away
         # from the pretrained distribution that the cluster layout was
         # optimized for. Typical values:
         #   pretrain: 0.0,  SFT: 0.01,  DPO/ORPO/GRPO: 0.1
         self.lambda_router_anchor: float = kwargs.pop("lambda_router_anchor", 0.0)
+        # Optional training-time miss simulation. When >0, MoE layers randomly
+        # route selected experts through the shared fallback while still adding
+        # the shared residual, matching the SSD/DRAM offload inference formula.
+        self.fallback_mask_prob: float = kwargs.pop("fallback_mask_prob", 0.0)
+        # Runtime offload policy. "on_demand" is the predictive low-latency
+        # path: cold SSD misses are queued for RAM and covered by shared
+        # fallback this token. "sync_on_demand" is the diagnostic path that
+        # synchronously loads the exact missed expert for Full-DRAM parity.
+        # "fallback_diagnostic" keeps the pure shared-fallback stress path.
+        self.offload_miss_policy_default: str = kwargs.pop("offload_miss_policy_default", "on_demand")
+        self.recommended_resident_experts: int | None = kwargs.pop("recommended_resident_experts", None)
         # M7: regularization defaults. MiniMindConfig defaults dropout=0.0
         # and weight_decay isn't even a config field — both major causes
         # of overfitting on small corpora. Override here.

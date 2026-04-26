@@ -53,7 +53,9 @@ MINIMIND_MOE_DEFAULTS: Dict = {
     "lambda_balance":        5e-4,
     "lambda_temporal":       1e-3,
     "lambda_lookahead":      0.1,
+    "lambda_lookahead_topk": 0.05,
     "lambda_router_anchor":  0.0,
+    "fallback_mask_prob":    0.0,
 
     # Hardware
     "vram_budget_gb":             4.0,
@@ -66,8 +68,21 @@ MINIMIND_MOE_DEFAULTS: Dict = {
     "accumulation_steps":    8,
     "epochs":                2,
     "save_interval":         1000,
+    "weight_decay":          0.01,
+    "grad_clip":             1.0,
+    "log_interval":          10,
+    "reward_spec":           "toy",
+    "max_gen_len":           24,
+    "num_generations":       4,
+    "temperature":           1.0,
+    "beta":                  0.1,
+    "alpha":                 0.7,
+    "lambda_or":             0.1,
     "save_dir":              "./out",
-    "dtype":                 "fp16",
+    "dtype":                 "auto",
+    "cpu_threads":           "auto",
+    "cpu_budget_percent":    100,
+    "num_workers":           "auto",
 }
 
 
@@ -78,10 +93,15 @@ CONFIG_INPUT_ORDER: List[str] = [
     "num_shared_experts", "lookahead_steps", "kv_latent_dim", "sliding_window_size",
     "num_attention_heads", "num_key_value_heads", "rope_dim", "moe_intermediate_size",
     "vocab_size", "dtype", "tie_word_embeddings",
-    "lambda_balance", "lambda_temporal", "lambda_lookahead", "lambda_router_anchor",
+    "lambda_balance", "lambda_temporal", "lambda_lookahead", "lambda_lookahead_topk", "lambda_router_anchor",
+    "fallback_mask_prob",
     "vram_budget_gb", "pinned_memory_max_fraction", "use_hybrid_attention", "storage_format",
     "learning_rate", "batch_size", "accumulation_steps", "max_seq_len",
-    "epochs", "save_interval", "save_dir",
+    "epochs", "save_interval", "log_interval", "save_dir",
+    "weight_decay", "grad_clip",
+    "cpu_threads", "cpu_budget_percent", "num_workers",
+    "reward_spec", "max_gen_len", "num_generations", "temperature",
+    "beta", "alpha", "lambda_or",
 ]
 
 
@@ -143,7 +163,9 @@ def preset_names() -> List[str]:
 
 def get_preset(name: str) -> Dict:
     """Return a deep-ish copy of the named preset (avoids accidental mutation)."""
-    return dict(PRESETS.get(name, MINIMIND_MOE_DEFAULTS))
+    cfg = dict(MINIMIND_MOE_DEFAULTS)
+    cfg.update(PRESETS.get(name, {}))
+    return cfg
 
 
 def values_in_input_order(cfg: Dict) -> List:
@@ -161,20 +183,37 @@ def values_in_input_order(cfg: Dict) -> List:
         "lookahead_steps": 2, "kv_latent_dim": 64, "sliding_window_size": 2048,
         "num_attention_heads": 8, "num_key_value_heads": 4, "rope_dim": 32,
         "moe_intermediate_size": 0, "vocab_size": 6400,
-        "dtype": "fp16", "tie_word_embeddings": True,
+        "dtype": "auto", "tie_word_embeddings": True,
         "lambda_balance": 5e-4, "lambda_temporal": 1e-3,
-        "lambda_lookahead": 0.1, "lambda_router_anchor": 0.0,
+        "lambda_lookahead": 0.1, "lambda_lookahead_topk": 0.05, "lambda_router_anchor": 0.0,
+        "fallback_mask_prob": 0.0,
         "vram_budget_gb": 4.0, "pinned_memory_max_fraction": 0.25,
         "use_hybrid_attention": True, "storage_format": "safetensors",
         "learning_rate": 5e-4, "batch_size": 16, "accumulation_steps": 8,
         "max_seq_len": 512, "epochs": 2, "save_interval": 1000,
         "save_dir": "./out",
+        "cpu_threads": "auto", "cpu_budget_percent": 100,
+        "num_workers": "auto",
+        "weight_decay": 0.01, "grad_clip": 1.0, "log_interval": 10,
+        "reward_spec": "toy",
+        "max_gen_len": 24, "num_generations": 4, "temperature": 1.0,
+        "beta": 0.1, "alpha": 0.7, "lambda_or": 0.1,
     }
     out = []
     for k in CONFIG_INPUT_ORDER:
         v = cfg.get(k) if k in cfg else MINIMIND_MOE_DEFAULTS.get(k)
         if v is None:
             v = SAFE.get(k, 0)
+        if k == "dtype":
+            normalized = str(v).strip().lower()
+            v = {
+                "fp32": "float32",
+                "bf16": "bfloat16",
+                "fp16": "float16",
+                "half": "float16",
+                "full": "float32",
+                "": "auto",
+            }.get(normalized, normalized)
         out.append(v)
     return out
 
@@ -191,4 +230,7 @@ def save_config(cfg: Dict, path: str) -> str:
 def load_config(path: str) -> Dict:
     """Read JSON and return the dict. Raises FileNotFoundError if missing."""
     with open(os.path.abspath(path)) as f:
-        return json.load(f)
+        loaded = json.load(f)
+    cfg = dict(MINIMIND_MOE_DEFAULTS)
+    cfg.update(loaded)
+    return cfg

@@ -28,6 +28,11 @@ from transformers import AutoTokenizer
 from chronos.model.config import ChronosConfig
 from chronos.model.model_chronos import ChronosForCausalLM
 from chronos.model.hybrid_attention import MLAAttention, SlidingWindowAttention
+from chronos.model.checkpoint import (
+    chronos_config_from_checkpoint,
+    load_checkpoint_state_dict,
+    load_state_dict_controlled,
+)
 
 
 def compute_perplexity(model, dataloader, device, max_batches=50):
@@ -73,22 +78,36 @@ def kv_cache_memory_bytes(past_key_values, model):
 
 
 def run_benchmark(args):
-    config = ChronosConfig(
-        hidden_size=args.hidden_size,
-        num_hidden_layers=args.num_hidden_layers,
-        num_experts=args.num_experts,
-        use_moe=True,
-        use_hybrid_attention=True,
-        kv_latent_dim=args.kv_latent_dim,
-        sliding_window_size=args.sliding_window_size,
-        vram_budget_gb=args.vram_budget_gb,
-    )
-    model = ChronosForCausalLM(config).to(args.device)
+    if args.model_path:
+        config, sources = chronos_config_from_checkpoint(
+            args.model_path,
+            overrides={
+                "vram_budget_gb": args.vram_budget_gb,
+                "max_position_embeddings": args.max_seq_len + args.max_new_tokens + 32,
+            },
+            require_unsniffable=True,
+        )
+        print(f"Config sources: {', '.join(sources)}")
+    else:
+        config = ChronosConfig(
+            hidden_size=args.hidden_size,
+            num_hidden_layers=args.num_hidden_layers,
+            num_experts=args.num_experts,
+            num_experts_per_tok=args.num_experts_per_tok,
+            num_shared_experts=args.num_shared_experts,
+            use_moe=True,
+            use_hybrid_attention=True,
+            kv_latent_dim=args.kv_latent_dim,
+            sliding_window_size=args.sliding_window_size,
+            vram_budget_gb=args.vram_budget_gb,
+        )
+    model = ChronosForCausalLM(config)
 
     if args.model_path:
-        weights = torch.load(args.model_path, map_location=args.device)
-        model.load_state_dict(weights, strict=False)
+        weights = load_checkpoint_state_dict(args.model_path, map_location="cpu")
+        load_state_dict_controlled(model, weights)
         print(f"Loaded: {args.model_path}")
+    model = model.to(args.device)
 
     tokenizer = AutoTokenizer.from_pretrained(
         chronos.deps.get_tokenizer_path()
@@ -148,6 +167,8 @@ def main():
     parser.add_argument("--hidden_size", type=int, default=512)
     parser.add_argument("--num_hidden_layers", type=int, default=8)
     parser.add_argument("--num_experts", type=int, default=4)
+    parser.add_argument("--num_experts_per_tok", type=int, default=2)
+    parser.add_argument("--num_shared_experts", type=int, default=1)
     parser.add_argument("--kv_latent_dim", type=int, default=64)
     parser.add_argument("--sliding_window_size", type=int, default=2048)
     parser.add_argument("--vram_budget_gb", type=float, default=4.0)

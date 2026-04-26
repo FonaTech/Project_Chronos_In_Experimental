@@ -7,7 +7,6 @@ import torch
 import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import DataLoader
-from contextlib import nullcontext
 
 from model.model_minimind import MiniMindConfig
 from trainer.trainer_utils import (
@@ -23,6 +22,14 @@ from chronos.model.config import ChronosConfig
 from chronos.model.model_chronos import ChronosForCausalLM
 from chronos.model.temporal_loss import lookahead_supervision_loss
 from chronos.trainer.loss_mixin import chronos_loss_term, collect_router_probs
+from chronos.model.checkpoint import save_state_dict_with_config
+from chronos.trainer.device_utils import (
+    autocast_context,
+    configure_cpu_threads,
+    grad_scaler,
+    optimizer_step_with_scaler,
+    runtime_summary,
+)
 
 
 class ChronosTrainer:
@@ -42,13 +49,18 @@ class ChronosTrainer:
         seed = getattr(args, "seed", None)
         if seed is not None:
             setup_seed(int(seed))
-        device_type = "cuda" if "cuda" in self.device else "cpu"
-        dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-        self.autocast_ctx = (
-            nullcontext() if device_type == "cpu"
-            else torch.cuda.amp.autocast(dtype=dtype)
+        configure_cpu_threads(
+            getattr(args, "cpu_threads", None),
+            budget_percent=getattr(args, "cpu_budget_percent", 100),
         )
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
+        self.autocast_ctx = autocast_context(self.device, getattr(args, "dtype", "float32"))
+        self.scaler = grad_scaler(self.device, getattr(args, "dtype", "float32"))
+        summary = runtime_summary(self.device, getattr(args, "dtype", "float32"))
+        Logger(
+            "Runtime: "
+            f"device={summary.device} type={summary.device_type} dtype={summary.dtype} "
+            f"cpu_threads={summary.cpu_threads} autocast={summary.autocast} scaler={summary.scaler}"
+        )
 
         self.model = ChronosForCausalLM(config).to(self.device)
         from chronos.trainer.optim_utils import build_optimizer
@@ -99,11 +111,12 @@ class ChronosTrainer:
         self.scaler.scale(loss).backward()
 
         if step % self.args.accumulation_steps == 0:
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)
+            optimizer_step_with_scaler(
+                self.scaler,
+                self.optimizer,
+                self.model.parameters(),
+                self.args.grad_clip,
+            )
 
         return loss.item() * self.args.accumulation_steps, ce_loss.item(), aux_loss.item(), lookahead_loss_val
 
@@ -139,8 +152,12 @@ class ChronosTrainer:
         self.model.eval()
         os.makedirs(self.args.save_dir, exist_ok=True)
         ckp = f'{self.args.save_dir}/chronos_{self.config.hidden_size}_moe.pth'
-        state = self.model.state_dict()
-        torch.save({k: v.half().cpu() for k, v in state.items()}, ckp)
+        save_state_dict_with_config(
+            self.model,
+            ckp,
+            self.config,
+            stage="chronos",
+        )
         lm_checkpoint(
             self.config, weight='chronos', model=self.model,
             optimizer=self.optimizer, scaler=self.scaler,
@@ -148,4 +165,3 @@ class ChronosTrainer:
             save_dir=self.args.save_dir,
         )
         self.model.train()
-        del state

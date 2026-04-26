@@ -111,6 +111,23 @@ class _StreamingJSONLBase(Dataset):
     def __len__(self):
         return len(self.offsets)
 
+    def __getstate__(self):
+        """Make streaming datasets safe for macOS/Windows spawn workers.
+
+        DataLoader with num_workers > 0 pickles the dataset. File handles and
+        thread locks cannot be pickled, and each worker must open its own file
+        descriptor anyway so seeks are process-local.
+        """
+        state = self.__dict__.copy()
+        state["_fh"] = None
+        state["_fh_lock"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._fh = None
+        self._fh_lock = threading.Lock()
+
     def __del__(self):
         try:
             if self._fh is not None:

@@ -22,6 +22,18 @@ from ui.presets import (
 )
 
 
+def _normalize_dtype_name(value: str | None) -> str:
+    normalized = (value or "auto").strip().lower()
+    return {
+        "fp32": "float32",
+        "bf16": "bfloat16",
+        "fp16": "float16",
+        "half": "float16",
+        "full": "float32",
+        "": "auto",
+    }.get(normalized, normalized)
+
+
 # Shared slider ranges (match Designer v1, which had the more permissive
 # bounds). The old Config tab had stricter bounds that surprised users
 # toggling between tabs and rejected values they typed manually.
@@ -66,7 +78,7 @@ def _estimate(cfg_dict: dict):
         sliding_window_size=int(cfg_dict.get("sliding_window_size", 2048)),
         use_hybrid_attention=bool(cfg_dict.get("use_hybrid_attention", True)),
         tie_word_embeddings=bool(cfg_dict.get("tie_word_embeddings", True)),
-        dtype=str(cfg_dict.get("dtype", "fp16")),
+        dtype=_normalize_dtype_name(str(cfg_dict.get("dtype", "auto"))),
     )
     mem = memory_footprint(arch)
     return (
@@ -161,8 +173,8 @@ def build_config_tab():
                 with gr.Row():
                     vocab_size = gr.Number(value=D["vocab_size"], precision=0, label=t("config.vocab_size"))
                     dtype      = gr.Dropdown(
-                        choices=["fp32", "bf16", "fp16", "int8", "nf4"],
-                        value=D["dtype"], label=t("config.dtype"),
+                        choices=["auto", "float32", "bfloat16", "float16"],
+                        value=_normalize_dtype_name(D.get("dtype", "auto")), label=t("config.dtype"),
                     )
                     tie_word_embeddings = gr.Checkbox(value=D["tie_word_embeddings"], label=t("config.tie_emb"))
                     register_translatable(vocab_size,          "config.vocab_size")
@@ -174,11 +186,17 @@ def build_config_tab():
                     lambda_balance       = gr.Number(value=D["lambda_balance"],       label=t("config.lambda_balance"),  precision=6)
                     lambda_temporal      = gr.Number(value=D["lambda_temporal"],      label=t("config.lambda_temporal"), precision=6)
                     lambda_lookahead     = gr.Number(value=D["lambda_lookahead"],     label=t("config.lambda_la"),       precision=6)
+                    lambda_lookahead_topk = gr.Number(value=D.get("lambda_lookahead_topk", 0.05),
+                                                       label=t("config.lambda_la_topk"), precision=6)
                     lambda_router_anchor = gr.Number(value=D["lambda_router_anchor"], label=t("config.lambda_anchor"),   precision=6)
+                    fallback_mask_prob   = gr.Slider(0.0, 1.0, value=D.get("fallback_mask_prob", 0.0),
+                                                      step=0.01, label=t("config.fallback_mask"))
                     register_translatable(lambda_balance,        "config.lambda_balance")
                     register_translatable(lambda_temporal,       "config.lambda_temporal")
                     register_translatable(lambda_lookahead,      "config.lambda_la")
+                    register_translatable(lambda_lookahead_topk, "config.lambda_la_topk")
                     register_translatable(lambda_router_anchor,  "config.lambda_anchor")
+                    register_translatable(fallback_mask_prob,    "config.fallback_mask")
 
                 gr.Markdown(f"### {t('config.hw')}")
                 with gr.Row():
@@ -206,10 +224,70 @@ def build_config_tab():
                 with gr.Row():
                     epochs        = gr.Slider(1, 1000,    value=D["epochs"],         step=1,   label=t("config.epochs"))
                     save_interval = gr.Slider(10, 100000, value=D["save_interval"],  step=10,  label=t("config.save_interval"))
+                    log_interval  = gr.Slider(1, 1000,    value=D.get("log_interval", 10), step=1, label="log_interval")
                     save_dir      = gr.Textbox(label=t("config.save_dir"),           value=D["save_dir"])
                     register_translatable(epochs,        "config.epochs")
                     register_translatable(save_interval, "config.save_interval")
                     register_translatable(save_dir,      "config.save_dir")
+
+                with gr.Row():
+                    weight_decay = gr.Number(
+                        value=float(D.get("weight_decay", 0.01)),
+                        label=t("config.weight_decay"),
+                        precision=6,
+                    )
+                    grad_clip = gr.Number(
+                        value=float(D.get("grad_clip", 1.0)),
+                        label="grad_clip",
+                        precision=4,
+                    )
+                    cpu_threads = gr.Textbox(
+                        value=str(D.get("cpu_threads", "auto")),
+                        label=t("config.cpu_threads"),
+                    )
+                    cpu_budget_percent = gr.Slider(
+                        1, 100,
+                        value=float(D.get("cpu_budget_percent", 100)),
+                        step=1,
+                        label=t("config.cpu_budget_percent"),
+                    )
+                    num_workers = gr.Textbox(
+                        value=str(D.get("num_workers", "auto")),
+                        label=t("config.num_workers"),
+                    )
+                    register_translatable(weight_decay, "config.weight_decay")
+                    register_translatable(cpu_threads, "config.cpu_threads")
+                    register_translatable(cpu_budget_percent, "config.cpu_budget_percent")
+                    register_translatable(num_workers, "config.num_workers")
+
+                with gr.Accordion("Stage optimizer / rollout options", open=False):
+                    with gr.Row():
+                        reward_spec = gr.Textbox(
+                            value=str(D.get("reward_spec", "toy")),
+                            label="reward",
+                            placeholder="toy or lm:/path/to/reward-model",
+                        )
+                        max_gen_len = gr.Slider(
+                            1, 2048,
+                            value=int(D.get("max_gen_len", 24)),
+                            step=1,
+                            label="max_gen_len",
+                        )
+                        num_generations = gr.Slider(
+                            1, 64,
+                            value=int(D.get("num_generations", 4)),
+                            step=1,
+                            label="num_generations",
+                        )
+                        temperature = gr.Number(
+                            value=float(D.get("temperature", 1.0)),
+                            label="temperature",
+                            precision=4,
+                        )
+                    with gr.Row():
+                        beta = gr.Number(value=float(D.get("beta", 0.1)), label="beta", precision=6)
+                        alpha = gr.Number(value=float(D.get("alpha", 0.7)), label="alpha", precision=6)
+                        lambda_or = gr.Number(value=float(D.get("lambda_or", 0.1)), label="lambda_or", precision=6)
 
                 config_display = gr.JSON(label="Current Config (saved to config_state)", value=initial_cfg)
 
@@ -236,10 +314,15 @@ def build_config_tab():
             num_shared, lookahead, kv_latent_dim, sliding_window,
             num_heads, num_kv_heads, rope_dim, moe_intermediate,
             vocab_size, dtype, tie_word_embeddings,
-            lambda_balance, lambda_temporal, lambda_lookahead, lambda_router_anchor,
+            lambda_balance, lambda_temporal, lambda_lookahead, lambda_lookahead_topk, lambda_router_anchor,
+            fallback_mask_prob,
             vram_budget, pinned_frac, use_hybrid_attn, storage_format,
             learning_rate, batch_size, accum_steps, max_seq_len,
-            epochs, save_interval, save_dir,
+            epochs, save_interval, log_interval, save_dir,
+            weight_decay, grad_clip,
+            cpu_threads, cpu_budget_percent, num_workers,
+            reward_spec, max_gen_len, num_generations, temperature,
+            beta, alpha, lambda_or,
         ]
         estimator_outs = [total_box, active_box, vram_box, ssd_box, kv_box, tps_box]
 
@@ -247,9 +330,11 @@ def build_config_tab():
             (hs, nl, ne, ept, ns, la, kv, sw,
              nh, nkv, rd, moe_i,
              vs, dt, tie,
-             lb, lt, ll, lra,
+             lb, lt, ll, llt, lra, fmp,
              vb, pf, ha, sf,
-             lr, bs, ac, msl, ep, si, sd) = vals
+             lr, bs, ac, msl, ep, si, li, sd,
+             wd, gc, ct, cbp, nw,
+             reward, mgl, ng, temp, beta, alpha, lor) = vals
             cfg = {
                 "hidden_size": int(hs), "num_hidden_layers": int(nl),
                 "num_experts": int(ne), "num_experts_per_tok": int(ept),
@@ -257,17 +342,32 @@ def build_config_tab():
                 "kv_latent_dim": int(kv), "sliding_window_size": int(sw),
                 "num_attention_heads": int(nh), "num_key_value_heads": int(nkv),
                 "rope_dim": int(rd), "moe_intermediate_size": int(moe_i),
-                "vocab_size": int(vs), "dtype": str(dt),
+                "vocab_size": int(vs), "dtype": _normalize_dtype_name(str(dt)),
                 "tie_word_embeddings": bool(tie),
                 "lambda_balance": float(lb), "lambda_temporal": float(lt),
-                "lambda_lookahead": float(ll), "lambda_router_anchor": float(lra),
+                "lambda_lookahead": float(ll), "lambda_lookahead_topk": float(llt),
+                "lambda_router_anchor": float(lra),
+                "fallback_mask_prob": float(fmp),
                 "vram_budget_gb": float(vb), "pinned_memory_max_fraction": float(pf),
                 "use_hybrid_attention": bool(ha),
                 "storage_format": str(sf),
                 "learning_rate": float(lr), "batch_size": int(bs),
                 "accumulation_steps": int(ac), "max_seq_len": int(msl),
                 "epochs": int(ep), "save_interval": int(si),
+                "weight_decay": float(wd),
+                "grad_clip": float(gc),
+                "log_interval": int(li),
+                "reward_spec": str(reward or "toy"),
+                "max_gen_len": int(mgl),
+                "num_generations": int(ng),
+                "temperature": float(temp),
+                "beta": float(beta),
+                "alpha": float(alpha),
+                "lambda_or": float(lor),
                 "save_dir": sd,
+                "cpu_threads": str(ct or "auto"),
+                "cpu_budget_percent": float(cbp or 100),
+                "num_workers": str(nw or "auto"),
             }
             est = _estimate(cfg)
             return (cfg, cfg) + est

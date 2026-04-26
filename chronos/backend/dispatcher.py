@@ -8,19 +8,18 @@ Chronos dispatches across these backend names:
   cpu     — PyTorch CPU (always available)
   cuda    — PyTorch CUDA (NVIDIA GPU)
   mps     — PyTorch Metal Performance Shaders (Apple Silicon via torch)
-  mlx     — Apple MLX (Apple Silicon, non-torch inference path in this repo)
+  mlx     — Apple MLX (Apple Silicon native inference/training path)
   xpu     — PyTorch Intel XPU
   vulkan  — PyTorch Vulkan (only if torch was built with USE_VULKAN=ON)
   opencl  — third-party extension hook (no upstream backend; plug-in only)
 
-Training support in the current repo: cpu, cuda, mps, xpu
+Training support in the current repo: cpu, cuda, mps, mlx, xpu
 Inference support (stock paths):      cpu, cuda, mps, mlx, xpu, (vulkan if built-in)
 Inference via ext plugin:             opencl
 
-Important: although MLX is available as an inference backend, this repository
-does not currently implement a full MLX-native training stack comparable to
-``chronos.trainer.*``. Training resolvers therefore exclude ``mlx`` until a
-real MLX trainer exists.
+Important: MLX is a non-torch backend. ``resolve_training_device("mlx")``
+returns ``("mlx", "mlx")`` so stage scripts can branch into
+``chronos.mlx.training`` before constructing PyTorch trainers.
 """
 from __future__ import annotations
 
@@ -40,8 +39,8 @@ AUTO_PRIORITY = ("mlx", "cuda", "xpu", "mps", "vulkan", "opencl", "cpu")
 # Training must only pick backends with an actual training implementation in
 # this repository. Keep this separate from AUTO_PRIORITY so inference can
 # still prefer MLX while training stays honest.
-TRAINING_AUTO_PRIORITY = ("cuda", "xpu", "mps", "cpu")
-TRAINING_BACKENDS = ("cuda", "xpu", "mps", "cpu")
+TRAINING_AUTO_PRIORITY = ("cuda", "xpu", "mlx", "mps", "cpu")
+TRAINING_BACKENDS = ("cuda", "xpu", "mlx", "mps", "cpu")
 
 
 @dataclass
@@ -100,15 +99,21 @@ def _probe_mlx() -> BackendInfo:
     if spec is None:
         return BackendInfo("mlx", False, False, False, None,
                            notes="mlx not installed")
+    training_spec = importlib.util.find_spec("chronos.mlx.training")
     try:
         import mlx.core as mx
         avail = bool(mx.metal.is_available())
     except Exception:
         avail = False
+    supports_training = bool(avail and training_spec is not None)
     return BackendInfo(
-        name="mlx", available=avail, supports_training=False,
+        name="mlx", available=avail, supports_training=supports_training,
         supports_amp=avail, torch_device=None,
-        notes="non-torch backend; Chronos uses chronos.mlx.* inference paths",
+        notes=(
+            "non-torch backend; Chronos uses chronos.mlx.* native paths"
+            if supports_training else
+            "non-torch backend; MLX training package not available"
+        ),
     )
 
 
@@ -242,8 +247,14 @@ class BackendDispatcher:
         return self.info(name).torch_device
 
     def training_device_str(self, name: Optional[str] = None) -> str:
-        """PyTorch device string for a training backend."""
+        """Device string for a training backend.
+
+        PyTorch backends return PyTorch device names. MLX returns ``"mlx"``
+        as a sentinel so callers can route to the native MLX trainer.
+        """
         backend = self.select_training(name)
+        if backend == "mlx":
+            return "mlx"
         return self.info(backend).torch_device or "cpu"
 
     def resolve_training_device(self, prefer: Optional[str] = None) -> tuple[str, str]:
@@ -268,12 +279,19 @@ class BackendDispatcher:
                 chosen = self.select_training()
                 return chosen, self.info(chosen).torch_device or "cpu"
 
+        if name == "mlx":
+            chosen = self.select_training(name)
+            if chosen == name:
+                return "mlx", "mlx"
+
         if name in {"cpu", "mps", "cuda", "xpu"}:
             chosen = self.select_training(name)
             if chosen == name:
                 return chosen, self.info(chosen).torch_device or "cpu"
 
         chosen = self.select_training(name or None)
+        if chosen == "mlx":
+            return "mlx", "mlx"
         return chosen, self.info(chosen).torch_device or "cpu"
 
     def supports_training(self, name: str) -> bool:

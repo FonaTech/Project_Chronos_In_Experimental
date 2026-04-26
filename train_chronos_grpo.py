@@ -1,15 +1,17 @@
 """train_chronos_grpo.py — Stage 5 (GRPO) entry point."""
 import argparse
-import os
 
 import chronos.deps  # noqa
-import torch
 from transformers import AutoTokenizer
 
 from chronos.backend import resolve_training_device
-from chronos.model.config import ChronosConfig
 from chronos.model.model_chronos import ChronosForCausalLM
 from chronos.trainer.grpo_trainer import ChronosGRPOTrainer, load_grpo_prompts
+from chronos.trainer.stage_utils import (
+    add_topology_args,
+    build_config_from_upstream,
+    load_required_checkpoint,
+)
 
 
 def main():
@@ -29,10 +31,11 @@ def main():
     p.add_argument("--log_interval", type=int, default=5)
     p.add_argument("--save_interval", type=int, default=10000)
     p.add_argument("--device", default="auto")
-    p.add_argument("--dtype", default="float16")
-    p.add_argument("--hidden_size", type=int, default=256)
-    p.add_argument("--num_hidden_layers", type=int, default=4)
-    p.add_argument("--num_experts", type=int, default=4)
+    p.add_argument("--dtype", default="auto")
+    p.add_argument("--num_workers", default="auto")
+    p.add_argument("--cpu_threads", default="auto")
+    p.add_argument("--cpu_budget_percent", default=100, type=float)
+    add_topology_args(p, defaults=False)
     p.add_argument("--beta", type=float, default=0.04, help="KL penalty weight")
     p.add_argument("--lambda_router_anchor", type=float, default=0.1)
     p.add_argument("--reward", type=str, default="toy",
@@ -41,28 +44,36 @@ def main():
     selected_backend, resolved_device = resolve_training_device(args.device)
     args.device = resolved_device
 
-    cfg = ChronosConfig(
-        hidden_size=args.hidden_size,
-        num_hidden_layers=args.num_hidden_layers,
-        num_experts=args.num_experts,
-        num_experts_per_tok=1,
-        max_position_embeddings=args.max_seq_len + args.max_gen_len,
-        flash_attn=False,
+    cfg, ckp_path, sources = build_config_from_upstream(
+        args,
+        default_stem="orpo",
+        max_positions=args.max_seq_len + args.max_gen_len,
         lambda_router_anchor=args.lambda_router_anchor,
     )
     tokenizer = AutoTokenizer.from_pretrained(chronos.deps.get_tokenizer_path())
-    model = ChronosForCausalLM(cfg).to(args.device)
+    prompts = load_grpo_prompts(args.data_path, max_prompts=args.steps)
+    if selected_backend == "mlx":
+        from chronos.mlx.training import run_mlx_stage
 
-    ckp_path = os.path.join(args.save_dir, f"{args.from_weight}_{cfg.hidden_size}_moe.pth")
-    if os.path.exists(ckp_path):
-        state = torch.load(ckp_path, map_location=args.device)
-        model.load_state_dict(state, strict=False)
-        print(f"[GRPO] Loaded {ckp_path}")
-    else:
-        print(f"[GRPO] No checkpoint at {ckp_path} — training from random init.")
+        print(f"[GRPO][MLX] Loaded {ckp_path}")
+        print(f"[GRPO][MLX] Topology sources: {', '.join(sources)}")
+        run_mlx_stage(
+            stage="grpo",
+            config=cfg,
+            checkpoint_path=ckp_path,
+            save_dir=args.save_dir,
+            prompts=prompts,
+            args=args,
+        )
+        return
+
+    model = ChronosForCausalLM(cfg)
+    load_required_checkpoint(model, ckp_path, args.device)
+    model = model.to(args.device)
+    print(f"[GRPO] Loaded {ckp_path}")
+    print(f"[GRPO] Topology sources: {', '.join(sources)}")
     print(f"[GRPO] Training backend: {selected_backend}  device={args.device}")
 
-    prompts = load_grpo_prompts(args.data_path, max_prompts=args.steps)
     from chronos.trainer.reward import build_reward_fn
     reward_fn = build_reward_fn(args.reward)
     trainer = ChronosGRPOTrainer(model, cfg, args, tokenizer, reward_fn=reward_fn)

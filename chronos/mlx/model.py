@@ -26,7 +26,7 @@ class RMSNormMLX(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return nn.RMSNorm(x.shape[-1], eps=self.eps)(x) * self.weight
+        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 class LookaheadRouterMLX(nn.Module):
@@ -36,16 +36,17 @@ class LookaheadRouterMLX(nn.Module):
         super().__init__()
         K = getattr(config, 'lookahead_steps', 2)
         self.lookahead_steps = K
-        self.proj = nn.Linear(
-            config.hidden_size,
-            config.num_experts * (K + 1),
-            bias=False,
+        hidden = max(1, config.hidden_size // 4)
+        self.proj = nn.Sequential(
+            nn.Linear(config.hidden_size, hidden, bias=False),
+            nn.SiLU(),
+            nn.Linear(hidden, config.num_experts * (K + 1), bias=False),
         )
         self.num_experts = config.num_experts
 
     def __call__(self, x: mx.array) -> mx.array:
         B, S, H = x.shape
-        out = self.proj(x)                                             # [B, S, E*(K+1)]
+        out = self.proj(x).astype(mx.float32)                          # [B, S, E*(K+1)]
         out = out.reshape(B, S, self.lookahead_steps + 1, self.num_experts)
         return mx.softmax(out, axis=-1)                                # [B, S, K+1, E]
 
@@ -149,33 +150,83 @@ class ChronosMLXModel(nn.Module):
         Convert a trained PyTorch ChronosForCausalLM to ChronosMLXModel.
         Copies weights layer by layer via numpy as bridge.
         """
-        import numpy as np
-        import torch
-
         mlx_model = ChronosMLXModel(config)
 
         def _to_mx(pt_tensor):
             return mx.array(pt_tensor.detach().float().cpu().numpy())
 
+        def _assign_linear(linear, sd, key, missing):
+            if key in sd:
+                linear.weight = _to_mx(sd[key])
+            else:
+                missing.append(key)
+
+        def _assign_norm(norm, sd, key, missing):
+            if key in sd:
+                norm.weight = _to_mx(sd[key])
+            else:
+                missing.append(key)
+
         # Embedding + head
         sd = pt_model.state_dict()
-        mlx_model.embed_tokens.weight = _to_mx(sd["model.embed_tokens.weight"])
-        mlx_model.lm_head.weight = _to_mx(sd["lm_head.weight"])
-        mlx_model.norm.weight = _to_mx(sd["model.norm.weight"])
+        missing = []
+        for key, obj in [
+            ("model.embed_tokens.weight", mlx_model.embed_tokens),
+            ("lm_head.weight", mlx_model.lm_head),
+        ]:
+            if key in sd:
+                obj.weight = _to_mx(sd[key])
+            else:
+                missing.append(key)
+        _assign_norm(mlx_model.norm, sd, "model.norm.weight", missing)
 
         for i in range(config.num_hidden_layers):
             prefix = f"model.layers.{i}"
             blk = mlx_model.layers[i]
-            blk.input_norm.weight = _to_mx(sd[f"{prefix}.input_layernorm.weight"])
-            blk.post_norm.weight  = _to_mx(sd[f"{prefix}.post_feedforward_layernorm.weight"])
-            # Attention weights are mapped by name if they match
+            _assign_norm(blk.input_norm, sd, f"{prefix}.input_layernorm.weight", missing)
+            _assign_norm(blk.post_norm, sd, f"{prefix}.post_attention_layernorm.weight", missing)
+
             attn = blk.self_attn
-            for attr in vars(attn):
-                pt_key = f"{prefix}.self_attn.{attr}.weight"
-                if pt_key in sd and hasattr(getattr(attn, attr, None), '__class__'):
-                    try:
-                        setattr(attn, attr,
-                                type(getattr(attn, attr))(_to_mx(sd[pt_key])))
-                    except Exception:
-                        pass
+            attn_linears = [
+                "q_nope_proj", "q_rope_proj", "kv_down_proj",
+                "k_nope_proj", "k_rope_proj", "v_proj", "o_proj",
+                "q_proj", "k_proj",
+            ]
+            for name in attn_linears:
+                if hasattr(attn, name):
+                    _assign_linear(getattr(attn, name), sd, f"{prefix}.self_attn.{name}.weight", missing)
+            for name in ["q_nope_norm", "q_rope_norm", "kv_down_norm", "q_norm", "k_norm"]:
+                if hasattr(attn, name):
+                    _assign_norm(getattr(attn, name), sd, f"{prefix}.self_attn.{name}.weight", missing)
+
+            moe = blk.mlp
+            if isinstance(moe, ChronosMLXMOE):
+                _assign_linear(moe.gate, sd, f"{prefix}.mlp.gate.weight", missing)
+                for ei, expert in enumerate(moe.experts):
+                    for proj in ("gate_proj", "up_proj", "down_proj"):
+                        _assign_linear(
+                            getattr(expert, proj),
+                            sd,
+                            f"{prefix}.mlp.experts.{ei}.{proj}.weight",
+                            missing,
+                        )
+                for si, expert in enumerate(moe.shared_experts):
+                    for proj in ("gate_proj", "up_proj", "down_proj"):
+                        _assign_linear(
+                            getattr(expert, proj),
+                            sd,
+                            f"{prefix}.mlp.shared_experts.{si}.{proj}.weight",
+                            missing,
+                        )
+
+        proj_layers = mlx_model.lookahead_router.proj.layers
+        _assign_linear(proj_layers[0], sd, "model.lookahead_router.proj.0.weight", missing)
+        _assign_linear(proj_layers[2], sd, "model.lookahead_router.proj.2.weight", missing)
+
+        if missing:
+            raise RuntimeError(
+                "MLX conversion is missing Chronos checkpoint tensors: "
+                + ", ".join(missing[:40])
+            )
+        mx.eval(mlx_model.parameters())
         return mlx_model

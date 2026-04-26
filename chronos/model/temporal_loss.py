@@ -92,6 +92,51 @@ def lookahead_supervision_loss(
     return total / valid_terms
 
 
+def lookahead_topk_hit_loss(
+    lookahead_probs: torch.Tensor,
+    teacher_router_probs: torch.Tensor,
+    lookahead_steps: int,
+    num_experts_per_tok: int,
+) -> torch.Tensor:
+    """
+    Differentiable top-k recall proxy for prefetch quality.
+
+    For each future offset k, take the real future router top-k set as a
+    stop-grad target and maximize the predicted probability mass assigned to
+    that set. This complements the soft CE objective with the operational
+    metric that matters to offloading: did the predicted buffer include the
+    experts that will be needed soon?
+    """
+    if lookahead_probs is None or teacher_router_probs is None:
+        return lookahead_probs.new_zeros(()) if lookahead_probs is not None else \
+               teacher_router_probs.new_zeros(())
+
+    B, S, Kp1, E = lookahead_probs.shape
+    K = min(int(lookahead_steps), Kp1 - 1)
+    top_k = max(1, min(int(num_experts_per_tok or 1), E))
+    if K <= 0 or S <= 1:
+        return lookahead_probs.new_zeros(())
+
+    teacher = teacher_router_probs.detach()
+    total = lookahead_probs.new_zeros(())
+    valid_terms = 0
+    for k in range(1, K + 1):
+        if S - k <= 0:
+            continue
+        teacher_k = teacher[:, k:, :]
+        pred_k = lookahead_probs[:, :-k, k, :]
+        target_ids = torch.topk(teacher_k, k=top_k, dim=-1).indices
+        target_mask = F.one_hot(target_ids, num_classes=E).sum(dim=-2).to(pred_k.dtype)
+        hit_mass = (pred_k * target_mask).sum(dim=-1).clamp_min(1e-9)
+        # Divide by top_k so a uniform predictor has comparable scale across
+        # top-k values; minimizing -log mass rewards covering the set.
+        total = total + (-torch.log(hit_mass / float(top_k))).mean()
+        valid_terms += 1
+    if valid_terms == 0:
+        return lookahead_probs.new_zeros(())
+    return total / valid_terms
+
+
 def total_loss(
     ce_loss: torch.Tensor,
     balance_loss: torch.Tensor,
@@ -103,6 +148,8 @@ def total_loss(
     teacher_probs: torch.Tensor = None,
     lookahead_steps: int = 0,
     lambda_lookahead: float = 0.0,
+    lambda_lookahead_topk: float = 0.0,
+    num_experts_per_tok: int = 1,
 ) -> torch.Tensor:
     """
     L_total = L_CE + λ1·L_balance + λ2·L_temporal + λ_lookahead·L_lookahead
@@ -120,5 +167,14 @@ def total_loss(
     ):
         loss = loss + lambda_lookahead * lookahead_supervision_loss(
             lookahead_probs, teacher_probs, lookahead_steps,
+        )
+    if (
+        lookahead_probs is not None
+        and teacher_probs is not None
+        and lambda_lookahead_topk > 0.0
+        and lookahead_steps > 0
+    ):
+        loss = loss + lambda_lookahead_topk * lookahead_topk_hit_loss(
+            lookahead_probs, teacher_probs, lookahead_steps, num_experts_per_tok,
         )
     return loss

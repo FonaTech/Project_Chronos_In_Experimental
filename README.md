@@ -2,7 +2,7 @@
 
 **A storage-aware MoE stack built for SSD+DRAM hybrid inference, with a full six-stage training pipeline.**
 
-[![PyPI](https://img.shields.io/pypi/v/project-chronos)](https://pypi.org/project/project-chronos/)
+[![PyPI](https://img.shields.io/pypi/v/Project_Chronos)](https://pypi.org/project/Project_Chronos/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 
@@ -104,7 +104,7 @@ Even the worst case does not hard-stop generation:
 output = avail[i] * expert_output + (1.0 - avail[i]) * shared_expert_output
 ```
 
-The shared expert is always resident, so generation continues while the missing expert finishes loading in the background. Quality degrades smoothly and recovers automatically once the expert becomes available.
+The shared expert is always resident, so generation continues while the missing expert finishes loading in the background. For exact lazy/offload comparison modes, Chronos synchronously materializes only the selected missing expert and evicts low-LRU experts to stay inside the resident budget; it does not silently full-load all experts. Quality degrades smoothly only when fallback mode is explicitly enabled.
 
 ---
 
@@ -187,6 +187,14 @@ flowchart LR
 | 5 GRPO | `train_chronos_grpo.py` | `PG * A - beta * KL` with `ToyReward` or pluggable `LMRewardModel` | 0.10 |
 | 6 Distill | `train_chronos_distill.py` | `alpha * T^2 * KL(student || teacher) + (1 - alpha) * CE` | 0.05 |
 
+Training dtype and resource policy:
+
+- `--dtype auto` is the default. MPS/MLX resolve to BF16-first for training stability, CUDA/XPU resolve to FP16, and CPU resolves to FP32 unless `--dtype float16` or `--dtype bfloat16` is set explicitly.
+- CPU training configures PyTorch to use physical cores by default. Override with `--cpu_threads` or `--cpu_budget_percent`.
+- On macOS, MPS/MLX training forces DataLoader workers to `0` by default to avoid Metal command-buffer crashes from multiprocessing. CPU/CUDA still use worker processes; advanced users can override the guard with `CHRONOS_ALLOW_METAL_DATALOADER_WORKERS=1`.
+- Native MLX training pushes UI logs, scalar readouts, and chart points every `log_interval` steps, and Web UI Stop is checked at each batch boundary.
+- The Web UI writes a warning-only `<checkpoint>.verify.json` after each stage. It checks no-mask vs all-available MoE parity and, on Apple Silicon, MLX prefill logits against the PyTorch CPU baseline.
+
 The full six-stage comparison harness lives in `tools/compare_minimind_chronos_v3.py`.
 
 ---
@@ -219,6 +227,7 @@ d.describe()    # human-readable capability summary
 - **First-class backends for training and inference**: `cpu`, `mps`, `cuda`, `mlx`
 - **Inference-only / experimental**: `vulkan` when PyTorch was custom-built with `USE_VULKAN=ON`
 - **Third-party extension hook**: `opencl`, via `chronos/backend/ext/opencl.py:PROBE()`
+- **Apple Silicon policy**: inference auto still prefers MLX; training keeps MLX on the native `chronos.mlx.*` path instead of calling `torch.model.to("mlx")`.
 
 Honest note: upstream PyTorch does not ship a real OpenCL backend, and Vulkan support is still niche. Chronos provides a dispatcher seam so external integrations can plug in cleanly without touching core code.
 
@@ -304,7 +313,7 @@ All lambda terms are searchable with Optuna TPE, together with structural hyperp
 ## Installation
 
 ```bash
-pip install project-chronos
+pip install Project_Chronos
 ```
 
 Or from source:
@@ -318,7 +327,7 @@ pip install -e ".[dev]"
 **MLX (Apple Silicon):**
 
 ```bash
-pip install "project-chronos[mlx]"
+pip install "Project_Chronos[mlx]"
 ```
 
 **vLLM serving (optional, Linux + CUDA only):**
@@ -337,7 +346,7 @@ pip install vllm
 
 ## Quick start
 
-### Web UI (M6: 7 tabs, 4 languages)
+### Web UI (M6: 8 tabs, 4 languages)
 
 ```bash
 chronos-ui
@@ -351,11 +360,30 @@ Tabs included:
 - `Train` with its own `data_path`
 - `6-Stage Pipeline` with per-stage dataset paths
 - `Inference`
+- `Export` for FP16/Q8_0 safetensors and GGUF deployment artifacts
 - `Benchmark` with Markdown table + bar plot
 - `Auto-Tune` with persistent logs and one-click `Apply Best -> Config`
 - `IO Monitor`
 
 Built-in i18n: `zh-Hans`, `zh-Hant`, `en`, `ja`
+
+### Deployment export
+
+```bash
+chronos export \
+    --model_path ./out/sft_384_moe.pth \
+    --output_dir ./exports/sft_384 \
+    --formats fp16-safetensors q8_0-safetensors fp16-gguf q8_0-gguf
+```
+
+Exports include `config.json`, `chronos_export_manifest.json`, and Chronos
+metadata for MoE top-k, shared fallback experts, lookahead router, hybrid
+attention, and optional expert-cache layout. Chronos can load exported
+`safetensors`/`GGUF` artifacts through its native lazy expert loader.
+
+Compatibility note: the GGUF files use `general.architecture=chronos`. Stock
+Ollama/llama.cpp builds need a Chronos architecture adapter to execute them
+correctly; Chronos is not a LLaMA tensor-layout clone.
 
 ### Stage 1: pretrain
 
@@ -384,6 +412,32 @@ python train_chronos_distill.py \
     --teacher_path ./out/sft_192_moe.pth \
     --from_weight grpo --save_dir ./out --device cpu \
     --alpha 0.7 --temperature 4.0
+```
+
+### Checkpoint and offload diagnostics
+
+Every new `.pth` checkpoint writes a sibling `*.config.json` with the MoE
+topology that cannot be recovered from tensor shapes, including
+`num_experts_per_tok`. Use the diagnostic command to verify chat-template
+generation, no-mask vs all-available masked drift, cold shared fallback,
+LookaheadRouter prediction quality, and SSD/RAM/VRAM offload stats.
+
+```bash
+python diagnose_checkpoint.py \
+    --model_path ./out/sft_384_moe.pth \
+    --config_path ./chronos_config.json \
+    --sft_data ./Dataset/sft_t2t.jsonl \
+    --mlx_parity \
+    --device cpu
+
+# or through the unified CLI:
+chronos diagnose --model_path ./out/sft_384_moe.pth --config_path ./chronos_config.json
+```
+
+For backend speed and dtype sanity checks:
+
+```bash
+python benchmark_training_backends.py --backends cpu mps mlx --dtypes auto bfloat16 float16 --steps 2
 ```
 
 ### End-to-end comparison (minimind vs Chronos)

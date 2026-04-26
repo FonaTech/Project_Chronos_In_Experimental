@@ -13,7 +13,25 @@ from ui.gradio_compat import gr
 
 import chronos.deps  # auto-bootstrap minimind on sys.path
 from ui.i18n import t, register_translatable, get_current_lang
+from ui.presets import MINIMIND_MOE_DEFAULTS
 from chronos.backend import training_available, resolve_training_device
+from chronos.trainer.device_utils import (
+    autocast_context,
+    configure_cpu_threads,
+    cpu_thread_snapshot,
+    dataloader_kwargs,
+    grad_scaler,
+    optimizer_step_with_scaler,
+    resolve_dtype_name,
+    runtime_summary,
+)
+from chronos.model.checkpoint import (
+    config_dict_for_checkpoint,
+    load_checkpoint_state_dict,
+    load_state_dict_controlled,
+    save_state_dict_with_config,
+    sniff_checkpoint_config,
+)
 
 
 STAGE_UI_ORDER = ["pretrain", "sft", "dpo", "orpo", "grpo", "distill"]
@@ -52,6 +70,8 @@ CHECKPOINT_TOPOLOGY_KEYS = (
     "hidden_size",
     "num_hidden_layers",
     "num_experts",
+    "num_experts_per_tok",
+    "num_shared_experts",
     "moe_intermediate_size",
     "vocab_size",
     "lookahead_steps",
@@ -244,7 +264,7 @@ DISTILL_TEACHER_PLACEHOLDER = {
     "ja": "空欄なら save_dir から sft_<H>_moe.pth を自動読み込み。上書き時だけパスを指定",
 }
 
-TRAIN_BACKEND_CHOICES = ["auto", "cuda", "xpu", "mps", "cpu"]
+TRAIN_BACKEND_CHOICES = ["auto", "cuda", "xpu", "mlx", "mps", "cpu"]
 
 TRAIN_BACKEND_LABELS = {
     "auto": {
@@ -270,6 +290,12 @@ TRAIN_BACKEND_LABELS = {
         "zh-Hant": "XPU",
         "en": "XPU",
         "ja": "XPU",
+    },
+    "mlx": {
+        "zh-Hans": "MLX",
+        "zh-Hant": "MLX",
+        "en": "MLX",
+        "ja": "MLX",
     },
     "cpu": {
         "zh-Hans": "CPU",
@@ -330,10 +356,141 @@ def _default_train_backend_value() -> str:
 
 
 def _normalize_dtype_for_trainer(dtype: str | None) -> str:
-    dt = (dtype or "fp16").strip().lower()
+    dt = (dtype or "auto").strip().lower()
+    if dt in {"auto", ""}:
+        return "auto"
     if dt in {"bf16", "bfloat16"}:
         return "bfloat16"
+    if dt in {"fp32", "float32", "full"}:
+        return "float32"
     return "float16"
+
+
+def _is_auto_value(value) -> bool:
+    return value in (None, "", "auto", 0, "0")
+
+
+def _cpu_budget_for_backend(cfg: dict, resolved_backend: str) -> float:
+    requested_threads = cfg.get("cpu_threads", "auto")
+    raw_budget = cfg.get("cpu_budget_percent", None)
+    if resolved_backend == "cpu" and _is_auto_value(requested_threads):
+        return 100.0 if raw_budget in (None, "", "auto") else float(raw_budget)
+    if raw_budget in (None, "", "auto"):
+        return 100.0
+    return float(raw_budget)
+
+
+def _effective_training_config(
+    cfg: dict,
+    *,
+    mode: str,
+    requested_backend: str,
+    resolved_backend: str,
+    device: str,
+    cpu_threads: int,
+    workers: int | None = None,
+) -> dict:
+    keys = [
+        "learning_rate",
+        "batch_size",
+        "accumulation_steps",
+        "epochs",
+        "max_steps",
+        "max_seq_len",
+        "save_interval",
+        "log_interval",
+        "weight_decay",
+        "grad_clip",
+        "dtype",
+        "cpu_threads",
+        "cpu_budget_percent",
+        "num_workers",
+        "max_gen_len",
+        "num_generations",
+        "temperature",
+        "beta",
+        "alpha",
+        "lambda_or",
+        "reward_spec",
+        "teacher_path",
+    ]
+    out = {
+        "mode": mode,
+        "requested_backend": requested_backend,
+        "resolved_backend": resolved_backend,
+        "device": device,
+        "effective_cpu_threads": int(cpu_threads),
+    }
+    if workers is not None:
+        out["effective_num_workers"] = int(workers)
+    for key in keys:
+        if key in cfg:
+            out[key] = cfg[key]
+    return out
+
+
+def _format_effective_training_config(summary: dict) -> str:
+    parts = []
+    for key in [
+        "mode",
+        "requested_backend",
+        "resolved_backend",
+        "device",
+        "dtype",
+        "learning_rate",
+        "batch_size",
+        "accumulation_steps",
+        "epochs",
+        "max_steps",
+        "max_seq_len",
+        "weight_decay",
+        "grad_clip",
+        "save_interval",
+        "log_interval",
+        "effective_cpu_threads",
+        "cpu_budget_percent",
+        "effective_num_workers",
+    ]:
+        if key in summary:
+            parts.append(f"{key}={summary[key]}")
+    return "Effective config: " + ", ".join(parts)
+
+
+def _prepare_training_run_config(
+    cfg: dict | None,
+    train_mode: str,
+    selected_backend: str | None,
+    data_path: str | None,
+    init_weight: str | None,
+    max_steps,
+    val_ratio,
+    teacher_path: str | None,
+    sample_prompt: str | None,
+) -> tuple[dict, dict]:
+    merged = dict(MINIMIND_MOE_DEFAULTS)
+    merged.update(dict(cfg) if cfg else {})
+    cfg = merged
+    requested_backend = (selected_backend or "auto").strip().lower() or "auto"
+    resolved_backend, resolved_device = resolve_training_device(requested_backend)
+    cfg["train_backend"] = requested_backend
+    cfg["device"] = resolved_device
+    cfg["data_path"] = data_path or cfg.get("data_path", "")
+    cfg["init_weight"] = _normalize_stage_init_value(init_weight)
+    cfg["max_steps"] = int(max_steps or 0)
+    cfg["val_ratio"] = float(val_ratio or 0.0)
+    cfg["teacher_path"] = teacher_path or ""
+    cfg["sample_prompt"] = sample_prompt or ""
+    cfg["cpu_budget_percent"] = _cpu_budget_for_backend(cfg, resolved_backend)
+    initial_effective = _effective_training_config(
+        cfg,
+        mode=train_mode,
+        requested_backend=requested_backend,
+        resolved_backend=resolved_backend,
+        device=resolved_device,
+        cpu_threads=0,
+        workers=None,
+    )
+    return cfg, initial_effective
 
 
 @contextmanager
@@ -358,89 +515,30 @@ def _trainer_logger_sink(put_line):
 
 
 def _sniff_checkpoint(path: str) -> dict:
-    import os as _os
-    if not path or not _os.path.exists(path):
-        return {}
     try:
-        import torch as _t
-        sd = _t.load(path, map_location="cpu")
-        if not isinstance(sd, dict):
-            return {}
-        out = {}
-
-        embed = sd.get("model.embed_tokens.weight")
-        if embed is not None:
-            out["vocab_size"], out["hidden_size"] = int(embed.shape[0]), int(embed.shape[1])
-
-        layer_idxs = set()
-        for k in sd.keys():
-            if k.startswith("model.layers."):
-                try:
-                    layer_idxs.add(int(k.split(".")[2]))
-                except (ValueError, IndexError):
-                    pass
-        if layer_idxs:
-            out["num_hidden_layers"] = max(layer_idxs) + 1
-
-        expert_idxs = set()
-        for k in sd.keys():
-            if k.startswith("model.layers.0.mlp.experts."):
-                try:
-                    expert_idxs.add(int(k.split(".")[5]))
-                except (ValueError, IndexError):
-                    pass
-        if expert_idxs:
-            out["num_experts"] = max(expert_idxs) + 1
-
-        gate = sd.get("model.layers.0.mlp.experts.0.gate_proj.weight")
-        if gate is not None:
-            out["moe_intermediate_size"] = int(gate.shape[0])
-
-        qw = sd.get("model.layers.0.self_attn.q_proj.weight")
-        kw = sd.get("model.layers.0.self_attn.k_proj.weight")
-        if qw is not None and kw is not None:
-            out["num_attention_heads_total_dim"] = int(qw.shape[0])
-            out["num_kv_heads_total_dim"] = int(kw.shape[0])
-
-        lookahead_proj = sd.get("model.lookahead_router.proj.2.weight")
-        if lookahead_proj is not None and out.get("num_experts"):
-            total = int(lookahead_proj.shape[0])
-            n_exp = int(out["num_experts"])
-            if n_exp > 0 and total % n_exp == 0:
-                # The router predicts current-token routing plus K future
-                # steps, so the saved output rows are (lookahead_steps + 1)
-                # * num_experts. Do not report the +1 as user topology.
-                out["lookahead_steps"] = max(0, total // n_exp - 1)
-
-        qnope = sd.get("model.layers.0.self_attn.q_nope_proj.weight")
-        qrope = sd.get("model.layers.0.self_attn.q_rope_proj.weight")
-        kvdown = sd.get("model.layers.0.self_attn.kv_down_proj.weight")
-        vproj = sd.get("model.layers.0.self_attn.v_proj.weight")
-        if qnope is not None and qrope is not None and out.get("hidden_size"):
-            candidates = [
-                n for n in range(1, out["hidden_size"] + 1)
-                if out["hidden_size"] % n == 0
-                and int(qrope.shape[0]) % n == 0
-                and int(qnope.shape[0]) % n == 0
-            ]
-            if candidates:
-                preferred = 8 if 8 in candidates else max(candidates)
-                head_dim = out["hidden_size"] // preferred
-                rope_dim = int(qrope.shape[0]) // preferred
-                nope_dim = int(qnope.shape[0]) // preferred
-                if rope_dim + nope_dim == head_dim:
-                    out["num_attention_heads"] = preferred
-                    out["rope_dim"] = rope_dim
-        if kvdown is not None:
-            out["kv_latent_dim"] = int(kvdown.shape[0])
-        if vproj is not None and out.get("kv_latent_dim"):
-            head_dim = out.get("hidden_size", 0) // max(out.get("num_attention_heads", 8), 1)
-            if head_dim > 0:
-                out["num_key_value_heads"] = max(1, int(vproj.shape[0]) // head_dim)
-
-        return out
+        cfg, _sources = config_dict_for_checkpoint(path, require_unsniffable=False)
+        return cfg or sniff_checkpoint_config(path)
     except Exception:
         return {}
+
+
+def _verify_checkpoint_warn(checkpoint_path: str, model_cfg, put_line) -> None:
+    try:
+        from chronos.verify import verify_checkpoint
+
+        report = verify_checkpoint(
+            checkpoint_path,
+            model_cfg,
+            device="cpu",
+            include_mlx=True,
+            write_json=True,
+        )
+        status = "ok" if report.get("ok") else "warning"
+        put_line(f"[verify] {status}; report={report.get('verify_json', '')}")
+        for warning in report.get("warnings", []):
+            put_line(f"[verify warning] {warning}")
+    except Exception as exc:
+        put_line(f"[verify warning] checkpoint verification failed: {exc}")
 
 
 # ── Background trainer thread ─────────────────────────────────────
@@ -462,6 +560,10 @@ class TrainSession:
         # M8a: live generation sample (updated each save_interval).
         self.last_sample: str = ""
         self.last_sample_step: int = 0
+        self.effective_config: dict = {}
+
+    def _normalise_effective_cpu_config(self, cfg: dict, resolved_backend: str) -> None:
+        cfg["cpu_budget_percent"] = _cpu_budget_for_backend(cfg, resolved_backend)
 
     def is_running(self):
         return self._thread is not None and self._thread.is_alive()
@@ -508,6 +610,9 @@ class TrainSession:
     def get_metrics(self):
         with self._metric_lock:
             return list(self._metrics)
+
+    def get_effective_config(self):
+        return dict(self.effective_config)
 
     def _stage_checkpoint_path(self, save_dir: str, mode: str, hidden_size: int) -> str:
         prefix = STAGE_CHECKPOINT_PREFIX.get(mode, "chronos")
@@ -564,6 +669,9 @@ class TrainSession:
             learning_rate=float(cfg.get("learning_rate", 5e-4)),
             accumulation_steps=max(1, int(cfg.get("accumulation_steps", 1))),
             grad_clip=float(cfg.get("grad_clip", 1.0)),
+            cpu_threads=cfg.get("cpu_threads", "auto"),
+            cpu_budget_percent=cfg.get("cpu_budget_percent", 100),
+            num_workers=cfg.get("num_workers", "auto"),
             log_interval=max(1, int(cfg.get("log_interval", 10))),
             save_interval=max(1, int(cfg.get("save_interval", 500))),
             save_dir=save_dir,
@@ -672,18 +780,25 @@ class TrainSession:
         if not sp:
             sp = _stage_sample_prompt(mode)
         tokenizer = self._load_tokenizer()
-        ids = tokenizer.encode(sp, return_tensors="pt").to(device)
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": sp}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        enc = tokenizer(rendered, return_tensors="pt", add_special_tokens=False)
+        ids = enc.input_ids.to(device)
         was_training = model.training
         model.eval()
         with torch.no_grad():
             gen = ids.clone()
             for _ in range(80):
-                o, _ = model(gen, use_cache=False)
+                with autocast_context(device, cfg.get("dtype", "auto")):
+                    o, _ = model(gen, use_cache=False)
                 nxt = o.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                 gen = torch.cat([gen, nxt], dim=-1)
                 if int(nxt.item()) == (tokenizer.eos_token_id or -1):
                     break
-        txt = tokenizer.decode(gen[0].tolist(), skip_special_tokens=True)
+        txt = tokenizer.decode(gen[0, ids.shape[1]:].tolist(), skip_special_tokens=True)
         if was_training:
             model.train()
         self.last_sample = txt
@@ -718,6 +833,7 @@ class TrainSession:
                 "sliding_window_size":       cfg.get("sliding_window_size", 2048),
                 "lambda_balance":            cfg.get("lambda_balance", 5e-4),
                 "lambda_temporal":           cfg.get("lambda_temporal", 1e-3),
+                "fallback_mask_prob":         cfg.get("fallback_mask_prob", 0.0),
                 "vram_budget_gb":            cfg.get("vram_budget_gb", 4.0),
                 "use_hybrid_attention":      cfg.get("use_hybrid_attention", True),
                 "use_moe":                   True,
@@ -736,6 +852,7 @@ class TrainSession:
                 ("intermediate_size",     "moe_intermediate_size"),
                 ("moe_intermediate_size", "moe_intermediate_size"),
                 ("lambda_lookahead",      "lambda_lookahead"),
+                ("lambda_lookahead_topk", "lambda_lookahead_topk"),
                 ("lambda_router_anchor",  "lambda_router_anchor"),
                 ("pinned_memory_max_fraction", "pinned_memory_max_fraction"),
                 ("storage_format",        "storage_format"),
@@ -792,8 +909,8 @@ class TrainSession:
                             "starting fresh instead.\n  " + "\n  ".join(mismatches)
                         )
                     else:
-                        weights = torch.load(resume_path, map_location="cpu")
-                        model.load_state_dict(weights, strict=False)
+                        weights = load_checkpoint_state_dict(resume_path, map_location="cpu")
+                        load_state_dict_controlled(model, weights)
                         self._put(f"Resumed from {resume_path}")
                 else:
                     self._put("Pretraining from random init")
@@ -815,18 +932,38 @@ class TrainSession:
                         + "\nLoad the matching preset/config first, or switch init_weight to the correct checkpoint."
                     )
 
-                weights = torch.load(load_path, map_location="cpu")
-                model.load_state_dict(weights, strict=False)
+                weights = load_checkpoint_state_dict(load_path, map_location="cpu")
+                load_state_dict_controlled(model, weights)
                 self._put(f"[{mode.upper()}] Initialized from {load_path}")
 
             requested_backend = (cfg.get("train_backend") or "auto").strip().lower() or "auto"
             resolved_backend, device = resolve_training_device(requested_backend)
             cfg["train_backend"] = requested_backend
             cfg["device"] = device
+            cfg["dtype"] = _normalize_dtype_for_trainer(cfg.get("dtype"))
+            self._normalise_effective_cpu_config(cfg, resolved_backend)
+            cpu_threads = configure_cpu_threads(
+                cfg.get("cpu_threads", "auto"),
+                budget_percent=cfg.get("cpu_budget_percent", 100),
+            )
+            rt = runtime_summary(device, cfg.get("dtype", "auto"))
             self._put(f"Training backend: {resolved_backend} (requested: {requested_backend})")
             self._put(f"Device: {device}")
-            model = model.to(device)
-            from chronos.trainer.optim_utils import build_optimizer, get_lr, apply_lr
+            self._put(
+                f"Runtime: dtype={rt.dtype} cpu_threads={rt.cpu_threads} "
+                f"autocast={rt.autocast} scaler={rt.scaler}"
+            )
+            thread_diag = cpu_thread_snapshot()
+            self._put(
+                "CPU thread env: "
+                f"torch={thread_diag.get('torch_num_threads')} "
+                f"interop={thread_diag.get('torch_num_interop_threads')} "
+                f"physical={thread_diag.get('physical_cores')} "
+                f"OMP={thread_diag.get('OMP_NUM_THREADS')} "
+                f"MKL={thread_diag.get('MKL_NUM_THREADS')} "
+                f"VECLIB={thread_diag.get('VECLIB_MAXIMUM_THREADS')} "
+                f"NUMEXPR={thread_diag.get('NUMEXPR_NUM_THREADS')}"
+            )
 
             data_path = cfg.get("data_path", "")
             max_seq_len = cfg.get("max_seq_len", 512)
@@ -839,7 +976,7 @@ class TrainSession:
             max_steps = int(cfg.get("max_steps", 0)) or None  # 0 => no cap
             base_lr = float(cfg.get("learning_rate", 5e-4))
             weight_decay = float(cfg.get("weight_decay", 0.01))
-            optimizer = build_optimizer(model, lr=base_lr, weight_decay=weight_decay)
+            optimizer = None
 
             if not data_path or not os.path.exists(data_path):
                 self._put("No dataset found — running synthetic smoke test (50 steps)")
@@ -873,14 +1010,38 @@ class TrainSession:
                 else:
                     train_ds, val_ds = None, None
                 loader = (
-                    DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False)
+                    DataLoader(
+                        train_ds,
+                        batch_size=batch_size,
+                        **dataloader_kwargs(device=device, num_workers=cfg.get("num_workers", "auto"), shuffle=True),
+                    )
                     if train_ds is not None else None
                 )
                 val_loader = (
-                    DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                               num_workers=0, pin_memory=False)
+                    DataLoader(
+                        val_ds,
+                        batch_size=batch_size,
+                        **dataloader_kwargs(device=device, num_workers=cfg.get("num_workers", "auto"), shuffle=False),
+                    )
                     if val_ds is not None else None
                 )
+            if loader is not None:
+                workers = getattr(loader, "num_workers", 0)
+                self._put(
+                    f"CPU threads configured: {cpu_threads}; DataLoader workers: {workers}"
+                )
+            else:
+                workers = None
+            self.effective_config = _effective_training_config(
+                cfg,
+                mode=mode,
+                requested_backend=requested_backend,
+                resolved_backend=resolved_backend,
+                device=device,
+                cpu_threads=cpu_threads,
+                workers=workers,
+            )
+            self._put(_format_effective_training_config(self.effective_config))
 
             if mode in {"grpo"}:
                 tokenizer = self._load_tokenizer()
@@ -892,6 +1053,136 @@ class TrainSession:
                 self.total_steps = min(planned, max_steps) if (max_steps and planned) else planned
             else:
                 prompts = None
+
+            stage_args = self._build_stage_args(cfg, mode, save_dir, model_cfg.hidden_size)
+            stage_args.device = device
+
+            if resolved_backend == "mlx":
+                from chronos.mlx.training import run_mlx_stage
+
+                self._put("[MLX] Running native MLX trainer; skipping PyTorch model.to()/optimizer path.")
+                try:
+                    planned = max(1, len(prompts if mode == "grpo" else loader) * stage_args.epochs)
+                except Exception:
+                    planned = int(stage_args.steps or max_steps or 0)
+                self.total_steps = min(planned, stage_args.steps) if (stage_args.steps and planned) else max(1, planned or stage_args.steps or 1)
+
+                def _mlx_progress(event: dict):
+                    kind = str(event.get("event", "step"))
+                    if kind == "start":
+                        total = int(event.get("steps", 0) or 0)
+                        if total > 0:
+                            self.total_steps = total
+                        self._put(
+                            f"[MLX {mode.upper()}] started dtype={event.get('dtype', '')} "
+                            f"total_steps={self.total_steps} accum={event.get('accumulation_steps', '')} "
+                            f"save_interval={event.get('save_interval', '')}"
+                        )
+                        return
+                    if kind == "step":
+                        step = int(event.get("step", event.get("steps", 0)) or 0)
+                        total = int(event.get("steps", self.total_steps) or self.total_steps)
+                        if total > 0:
+                            self.total_steps = total
+                        loss = float(event.get("loss", 0.0) or 0.0)
+                        tps = float(event.get("tps", 0.0) or 0.0)
+                        self.step = step
+                        self.loss = loss
+                        metric = {
+                            "step": step,
+                            "total": loss,
+                            "primary": float(event.get("ce", loss) or loss),
+                            "secondary": float(event.get("aux", 0.0) or 0.0),
+                            "tertiary": float(event.get("temporal", 0.0) or 0.0),
+                            "ce": float(event.get("ce", loss) or loss),
+                            "aux": float(event.get("aux", 0.0) or 0.0),
+                            "temporal": float(event.get("temporal", 0.0) or 0.0),
+                            "tps": tps,
+                        }
+                        self._put_metric(metric)
+                        self._put(
+                            f"[MLX {mode.upper()}] step={step}/{self.total_steps} loss={loss:.4f} "
+                            f"steps/s={tps:.2f} lr={float(event.get('lr', 0.0) or 0.0):.2e} "
+                            f"elapsed={float(event.get('elapsed_s', 0.0) or 0.0):.1f}s"
+                        )
+                        return
+                    if kind == "rollback":
+                        step = int(event.get("step", 0) or 0)
+                        total = int(event.get("steps", self.total_steps) or self.total_steps)
+                        if total > 0:
+                            self.total_steps = total
+                        self._put(
+                            f"[MLX {mode.upper()} rollback] step={step}/{self.total_steps} "
+                            f"reason={event.get('reason', '')} rollbacks={int(event.get('rollbacks', 0) or 0)} "
+                            f"next_lr={float(event.get('lr', 0.0) or 0.0):.2e}"
+                        )
+                        return
+                    if kind == "save":
+                        self._put(
+                            f"[MLX {mode.upper()}] saved checkpoint ({event.get('reason', '')}) → "
+                            f"{event.get('checkpoint_path', '')}"
+                        )
+                        return
+                    if kind == "stopped":
+                        if int(event.get("steps", 0) or 0) > 0:
+                            self.total_steps = int(event.get("steps", 0) or 0)
+                        self._put(
+                            f"[MLX {mode.upper()}] stopped at step={int(event.get('step', 0) or 0)}/{self.total_steps}"
+                        )
+                        return
+                    if kind == "failed":
+                        self._put(
+                            f"[MLX {mode.upper()}] stopped after rollback limit at "
+                            f"step={int(event.get('step', 0) or 0)}/{int(event.get('steps', self.total_steps) or self.total_steps)}"
+                        )
+                        return
+                    if kind == "complete":
+                        self._put(
+                            f"[MLX {mode.upper()}] completed step={int(event.get('step', 0) or 0)}/"
+                            f"{int(event.get('steps', self.total_steps) or self.total_steps)}"
+                        )
+
+                result = run_mlx_stage(
+                    stage=mode,
+                    config=model_cfg,
+                    checkpoint_path=(resume_path if mode == "pretrain" and os.path.exists(resume_path) else load_path or None),
+                    save_dir=save_dir,
+                    loader=loader,
+                    prompts=prompts,
+                    teacher_path=stage_args.teacher_path if mode == "distill" else None,
+                    args=stage_args,
+                    progress_callback=_mlx_progress,
+                    stop_event=self._stop,
+                )
+                self.step = int(result.steps)
+                self.loss = float(result.last_loss)
+                self.total_steps = max(self.total_steps, int(result.total_steps or 0), self.step)
+                elapsed = time.monotonic() - t_start
+                if self._stop.is_set():
+                    self.status = "stopped"
+                    self._put(f"[MLX {mode.upper()}] Stopped in {elapsed:.1f}s. Saved → {result.checkpoint_path}")
+                    if result.checkpoint_saved:
+                        _verify_checkpoint_warn(result.checkpoint_path, model_cfg, self._put)
+                    return
+                if result.stopped:
+                    self.status = "error"
+                    self._put(
+                        f"[MLX {mode.upper()}] Stopped after rollback limit in {elapsed:.1f}s. "
+                        f"Last finite checkpoint → {result.checkpoint_path}"
+                    )
+                    if result.checkpoint_saved:
+                        _verify_checkpoint_warn(result.checkpoint_path, model_cfg, self._put)
+                    return
+                self._put(f"[MLX {mode.upper()}] Training complete in {elapsed:.1f}s. Saved → {result.checkpoint_path}")
+                _verify_checkpoint_warn(result.checkpoint_path, model_cfg, self._put)
+                self.status = "finished"
+                return
+
+            model = model.to(device)
+            from chronos.trainer.optim_utils import build_optimizer, get_lr, apply_lr
+            optimizer = build_optimizer(model, lr=base_lr, weight_decay=weight_decay)
+            train_autocast = autocast_context(device, cfg.get("dtype", "auto"))
+            scaler = grad_scaler(device, cfg.get("dtype", "auto"))
 
             model.train()
             global_step = 0
@@ -906,9 +1197,6 @@ class TrainSession:
             if mode != "grpo":
                 self.total_steps = min(planned, max_steps) if (max_steps and planned) else (planned or (max_steps or 0))
 
-            stage_args = self._build_stage_args(cfg, mode, save_dir, model_cfg.hidden_size)
-            stage_args.device = device
-
             if mode in {"sft", "dpo", "orpo", "grpo", "distill"}:
                 tokenizer = self._load_tokenizer()
 
@@ -922,7 +1210,8 @@ class TrainSession:
                         if k >= 50:  # cap eval cost
                             break
                         vx = vx.to(device); vy = vy.to(device)
-                        vout, _ = model(vx, labels=vy)
+                        with autocast_context(device, cfg.get("dtype", "auto")):
+                            vout, _ = model(vx, labels=vy)
                         tot += float(vout.loss.item()); n += 1
                 model.train()
                 return tot / max(n, 1)
@@ -1049,9 +1338,10 @@ class TrainSession:
                         teacher_path = stage_args.teacher_path
                         if not os.path.exists(teacher_path):
                             raise FileNotFoundError(f"[DISTILL] teacher not found: {teacher_path}")
-                        teacher = ChronosForCausalLM(model_cfg).to(device)
-                        t_state = torch.load(teacher_path, map_location=device)
-                        teacher.load_state_dict(t_state, strict=False)
+                        teacher = ChronosForCausalLM(model_cfg)
+                        t_state = load_checkpoint_state_dict(teacher_path, map_location="cpu")
+                        load_state_dict_controlled(teacher, t_state)
+                        teacher = teacher.to(device)
                         teacher.eval().requires_grad_(False)
                         self._put(f"[DISTILL] Teacher: {teacher_path}")
                         trainer = ChronosDistillTrainer(model, teacher, model_cfg, stage_args, tokenizer)
@@ -1081,6 +1371,7 @@ class TrainSession:
                 self._generate_live_sample(model, device, cfg, mode)
                 elapsed = time.monotonic() - t_start
                 self._put(f"[{mode.upper()}] Training complete in {elapsed:.1f}s. Saved → {ckp_path}")
+                _verify_checkpoint_warn(ckp_path, model_cfg, self._put)
                 self.status = "finished"
                 return
 
@@ -1097,35 +1388,35 @@ class TrainSession:
                     input_ids = input_ids.to(device)
                     labels = labels.to(device)
 
-                    out, lp = model(input_ids, labels=labels)
-                    moe_layers = [l.mlp for l in model.model.layers
-                                  if isinstance(l.mlp, ChronosMOEFeedForward)]
+                    with train_autocast:
+                        out, lp = model(input_ids, labels=labels)
+                        moe_layers = [l.mlp for l in model.model.layers
+                                      if isinstance(l.mlp, ChronosMOEFeedForward)]
 
-                    aux_val = out.aux_loss.item() if hasattr(out, "aux_loss") else 0.0
+                        aux_val = out.aux_loss.item() if hasattr(out, "aux_loss") else 0.0
 
-                    # Use the shared loss helper so λ_temporal / λ_lookahead
-                    # actually flow gradient back to the gate. The previous
-                    # path passed the detached `last_router_probs` into
-                    # total_loss, which made the regularizers inert (the
-                    # gate received only CE gradient, so router-locality was
-                    # never learned even after thousands of steps).
-                    from chronos.trainer.loss_mixin import (
-                        chronos_loss_term, collect_router_probs,
-                    )
-                    loss = chronos_loss_term(
-                        model, out.loss, lp, model_cfg, aux_loss=out.aux_loss,
-                    )
-                    # Logging-only: detached probs are fine here.
-                    router_4d_det = collect_router_probs(model, with_grad=False)
-                    if router_4d_det is not None and router_4d_det.shape[1] > 1:
-                        from chronos.model.temporal_loss import temporal_locality_loss
-                        temp_val = temporal_locality_loss(
-                            router_4d_det.mean(dim=2)
-                        ).item()
-                    else:
-                        temp_val = 0.0
+                        # Use the shared loss helper so lambda_temporal /
+                        # lambda_lookahead actually flow gradient back to the
+                        # gate.
+                        from chronos.trainer.loss_mixin import (
+                            chronos_loss_term, collect_router_probs,
+                        )
+                        loss = chronos_loss_term(
+                            model, out.loss, lp, model_cfg, aux_loss=out.aux_loss,
+                        )
+                        # Logging-only: detached probs are fine here.
+                        router_4d_det = collect_router_probs(model, with_grad=False)
+                        if router_4d_det is not None and router_4d_det.shape[1] > 1:
+                            from chronos.model.temporal_loss import temporal_locality_loss
+                            temp_val = temporal_locality_loss(
+                                router_4d_det.mean(dim=2)
+                            ).item()
+                        else:
+                            temp_val = 0.0
 
-                    (loss / accum).backward()
+                        step_loss = loss / accum
+
+                    scaler.scale(step_loss).backward()
                     global_step += 1
                     self.step = global_step
                     self.loss = loss.item()
@@ -1139,10 +1430,12 @@ class TrainSession:
                     # Previous code did the same check but had no warmup-aware
                     # accumulation count, occasionally stepping after step 1.
                     if global_step % accum == 0:
-                        import torch.nn as nn
-                        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
+                        optimizer_step_with_scaler(
+                            scaler,
+                            optimizer,
+                            model.parameters(),
+                            1.0,
+                        )
 
                     if global_step % log_interval == 0:
                         now = time.monotonic()
@@ -1168,9 +1461,11 @@ class TrainSession:
 
                     if global_step % save_interval == 0:
                         os.makedirs(save_dir, exist_ok=True)
-                        torch.save(
-                            {k: v.half().cpu() for k, v in model.state_dict().items()},
-                            ckp_path
+                        save_state_dict_with_config(
+                            model,
+                            ckp_path,
+                            model_cfg,
+                            stage=STAGE_CHECKPOINT_PREFIX.get(mode, mode),
                         )
                         self._put(f"Saved checkpoint → {ckp_path}")
 
@@ -1186,9 +1481,11 @@ class TrainSession:
                             })
                             if v < best_val:
                                 best_val = v
-                                torch.save(
-                                    {k: vv.half().cpu() for k, vv in model.state_dict().items()},
+                                save_state_dict_with_config(
+                                    model,
                                     best_path,
+                                    model_cfg,
+                                    stage=STAGE_CHECKPOINT_PREFIX.get(mode, mode),
                                 )
                                 self._put(f"  ↑ new best → {best_path}")
 
@@ -1202,17 +1499,25 @@ class TrainSession:
                             if not sp:
                                 sp = _stage_sample_prompt(mode)
                             tokenizer = self._load_tokenizer()
-                            ids = tokenizer.encode(sp, return_tensors="pt").to(device)
+                            rendered = tokenizer.apply_chat_template(
+                                [{"role": "user", "content": sp}],
+                                tokenize=False,
+                                add_generation_prompt=True,
+                            )
+                            ids = tokenizer(
+                                rendered, return_tensors="pt", add_special_tokens=False
+                            ).input_ids.to(device)
                             model.eval()
                             with torch.no_grad():
                                 gen = ids.clone()
                                 for _ in range(80):
-                                    o, _ = model(gen, use_cache=False)
+                                    with autocast_context(device, cfg.get("dtype", "auto")):
+                                        o, _ = model(gen, use_cache=False)
                                     nxt = o.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                                     gen = torch.cat([gen, nxt], dim=-1)
                                     if int(nxt.item()) == (tokenizer.eos_token_id or -1):
                                         break
-                            txt = tokenizer.decode(gen[0].tolist(), skip_special_tokens=True)
+                            txt = tokenizer.decode(gen[0, ids.shape[1]:].tolist(), skip_special_tokens=True)
                             model.train()
                             self.last_sample = txt
                             self.last_sample_step = global_step
@@ -1221,12 +1526,15 @@ class TrainSession:
                             self._put(f"[sample failed: {gen_err}]")
 
             os.makedirs(save_dir, exist_ok=True)
-            torch.save(
-                {k: v.half().cpu() for k, v in model.state_dict().items()},
-                ckp_path
+            save_state_dict_with_config(
+                model,
+                ckp_path,
+                model_cfg,
+                stage=STAGE_CHECKPOINT_PREFIX.get(mode, mode),
             )
             elapsed = time.monotonic() - t_start
             self._put(f"Training complete in {elapsed:.1f}s. Saved → {ckp_path}")
+            _verify_checkpoint_warn(ckp_path, model_cfg, self._put)
             self.status = "finished"
 
         except Exception as e:
@@ -1479,34 +1787,15 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
                 0.0, 0.5, value=0.05, step=0.01,
                 label=t("train.val_ratio"), scale=2,
             )
-            weight_decay_in = gr.Number(
-                value=0.01, precision=4,
-                label=t("train.weight_decay"), scale=1,
+            weight_decay_in = gr.Textbox(
+                value="from Config tab",
+                label=t("train.weight_decay"),
+                interactive=False,
+                scale=1,
             )
             register_translatable(max_steps_in,    "train.max_steps")
             register_translatable(val_ratio_in,    "train.val_ratio")
             register_translatable(weight_decay_in, "train.weight_decay")
-
-        with gr.Row():
-            reward_spec_in = gr.Textbox(
-                value="toy",
-                label="reward",
-                placeholder="toy or lm:/path/to/reward-model",
-                visible=False,
-                scale=2,
-            )
-            grpo_temp_in = gr.Number(
-                value=1.0, precision=3,
-                label="temperature",
-                visible=False,
-                scale=1,
-            )
-            grpo_num_gen_in = gr.Number(
-                value=4, precision=0,
-                label="num_generations",
-                visible=False,
-                scale=1,
-            )
 
         with gr.Row():
             sample_prompt_in = gr.Textbox(
@@ -1546,6 +1835,11 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
         )
         register_translatable(log_box, "train.log")
 
+        effective_config_box = gr.JSON(
+            label="Effective Training Config",
+            value={},
+        )
+
         # ── Live generation sample (updated each save_interval) ───
         sample_box = gr.Textbox(
             label=t("train.sample_output"), lines=6,
@@ -1569,7 +1863,6 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
                 data_value = data_default
             init_value = current_init
             teacher_visible = train_mode == "distill"
-            reward_visible = train_mode == "grpo"
             if (not current) or current in DEFAULT_SAMPLE_PROMPT_VALUES:
                 prompt_update = gr.update(
                     value=_stage_sample_prompt(train_mode),
@@ -1583,34 +1876,28 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
                 gr.update(value=data_value, placeholder=data_default),
                 gr.update(value=init_value, placeholder=init_placeholder),
                 gr.update(visible=teacher_visible, placeholder=_distill_teacher_placeholder()),
-                gr.update(visible=reward_visible),
-                gr.update(visible=reward_visible),
-                gr.update(visible=reward_visible),
                 gr.update(label=metric_labels[0]),
                 gr.update(label=metric_labels[1]),
                 gr.update(label=metric_labels[2]),
             )
 
-        def start_training(cfg, train_mode, selected_backend, dpath, iw, ms, vr, wd, reward_spec, grpo_temp, grpo_num_gen, teacher, sp):
+        def start_training(cfg, train_mode, selected_backend, dpath, iw, ms, vr, _wd_display, teacher, sp):
             if _session.is_running():
-                return "already running", 0, 0.0, 0.0, 0.0, 0.0, "Already running.\n", None, ""
-            cfg = dict(cfg) if cfg else {}
-            requested_backend = (selected_backend or "auto").strip().lower() or "auto"
-            _, resolved_device = resolve_training_device(requested_backend)
-            cfg["train_backend"] = requested_backend
-            cfg["device"] = resolved_device
-            cfg["data_path"] = dpath or cfg.get("data_path", "")
-            cfg["init_weight"] = _normalize_stage_init_value(iw)
-            cfg["max_steps"] = int(ms or 0)
-            cfg["val_ratio"] = float(vr or 0.0)
-            cfg["weight_decay"] = float(wd or 0.0)
-            cfg["reward_spec"] = reward_spec or "toy"
-            cfg["temperature"] = float(grpo_temp or 1.0)
-            cfg["num_generations"] = int(grpo_num_gen or 4)
-            cfg["teacher_path"] = teacher or ""
-            cfg["sample_prompt"] = sp or ""
+                return "already running", 0, 0.0, 0.0, 0.0, 0.0, "Already running.\n", None, "", _session.get_effective_config()
+            cfg, initial_effective = _prepare_training_run_config(
+                cfg,
+                train_mode,
+                selected_backend,
+                dpath,
+                iw,
+                ms,
+                vr,
+                teacher,
+                sp,
+            )
+            _session.effective_config = initial_effective
             _session.start(cfg, train_mode)
-            return "running", 0, 0.0, 0.0, 0.0, 0.0, "Starting...\n", None, ""
+            return "running", 0, 0.0, 0.0, 0.0, 0.0, "Starting...\n", None, "", initial_effective
 
         def stop_training():
             _session.stop()
@@ -1653,6 +1940,7 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
                 combined,
                 fig,
                 _session.last_sample or "",
+                _session.get_effective_config(),
             )
 
         mode.change(
@@ -1660,7 +1948,7 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
             inputs=[mode, sample_prompt_in, data_path, init_weight],
             outputs=[
                 sample_prompt_in, stage_help, data_path, init_weight,
-                teacher_path, reward_spec_in, grpo_temp_in, grpo_num_gen_in,
+                teacher_path,
                 loss_box, ce_box, aux_box,
             ],
         )
@@ -1669,10 +1957,9 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
             fn=start_training,
             inputs=[config_state, mode, train_backend, data_path, init_weight,
                     max_steps_in, val_ratio_in, weight_decay_in,
-                    reward_spec_in, grpo_temp_in, grpo_num_gen_in, teacher_path,
-                    sample_prompt_in],
+                    teacher_path, sample_prompt_in],
             outputs=[status_box, step_box, loss_box, ce_box, aux_box, tps_box,
-                     log_box, chart, sample_box],
+                     log_box, chart, sample_box, effective_config_box],
         )
         stop_btn.click(fn=stop_training, outputs=[status_box])
         clear_btn.click(fn=clear_log, outputs=[log_box])
@@ -1682,7 +1969,7 @@ def build_train_tab(config_state: gr.State, cfg_save_dir: gr.Textbox):
             fn=poll,
             inputs=[log_box, mode],
             outputs=[status_box, step_box, loss_box, ce_box, aux_box, tps_box,
-                     log_box, chart, sample_box],
+                     log_box, chart, sample_box, effective_config_box],
         )
 
     return tab

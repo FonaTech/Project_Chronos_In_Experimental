@@ -97,6 +97,13 @@ class CacheManager:
         compute overlap. Returns the submitted expert IDs."""
         return self.scheduler.prefetch_only(lookahead_probs)
 
+    def prefetch_experts_to_ram(self, expert_ids: List[int]) -> List[int]:
+        """Queue exact expert IDs for SSD->RAM prefetch without touching VRAM."""
+        expert_ids = list(dict.fromkeys(int(eid) for eid in expert_ids or []))
+        if expert_ids:
+            self.prefetcher.submit(expert_ids)
+        return expert_ids
+
     def ensure_resident(self, expert_ids: List[int]) -> List[int]:
         """Promote `expert_ids` to VRAM (non-blocking H2D) and then have the
         compute stream wait on *only those* events. Returns the list newly

@@ -16,6 +16,7 @@ import pandas as pd
 
 import chronos.deps  # noqa: F401
 from ui.i18n import t, register_translatable
+from chronos.trainer.device_utils import configure_cpu_threads, cpu_thread_snapshot
 
 RESULTS_FILE = os.path.join(os.path.dirname(__file__), '../../benchmark_results.json')
 
@@ -144,17 +145,22 @@ def build_benchmark_tab():
 
         def run_benchmark():
             import subprocess, sys
+            import os as _os
             script = os.path.join(os.path.dirname(__file__), '../../benchmark_compare.py')
+            threads = configure_cpu_threads("auto", budget_percent=100)
+            env = dict(_os.environ)
+            for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+                env[key] = str(threads)
             log_lines = []
             yield (
                 {}, _format_table({}), _empty_df(),
-                "Running benchmark... (this takes ~2 minutes)\n",
+                f"Running benchmark... CPU threads={threads} {cpu_thread_snapshot()}\n",
             )
             try:
                 proc = subprocess.Popen(
                     [sys.executable, script],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1,
+                    text=True, bufsize=1, env=env,
                 )
                 for line in proc.stdout:
                     log_lines.append(line.rstrip())

@@ -13,45 +13,50 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
-def _rope_freqs(dim: int, max_len: int = 4096, base: float = 10000.0) -> mx.array:
-    """Precompute RoPE cos/sin tables [max_len, dim/2].
+def _rope_freqs(
+    dim: int,
+    max_len: int = 4096,
+    base: float = 1_000_000.0,
+    rope_scaling: dict | None = None,
+) -> mx.array:
+    """Precompute MiniMind/PyTorch-compatible RoPE tables [max_len, dim].
 
-    `dim` is rounded down to the nearest even number internally so the
-    cos/sin half-dimension is well-defined. Callers that pass an odd
-    `dim` get tables that match the even portion only.
+    The PyTorch path uses duplicated cos/sin columns and rotate-half over the
+    whole last dimension. MLX must mirror that exactly for checkpoint parity.
     """
-    even = dim - (dim % 2)
-    half = max(even // 2, 1)
-    theta = 1.0 / (base ** (mx.arange(0, half, dtype=mx.float32) / half))
+    half = max(dim // 2, 1)
+    theta = 1.0 / (base ** (mx.arange(0, dim, 2, dtype=mx.float32)[:half] / dim))
+    attn_factor = 1.0
+    if rope_scaling is not None:
+        orig_max = float(rope_scaling.get("original_max_position_embeddings", 2048))
+        factor = float(rope_scaling.get("factor", 16))
+        beta_fast = float(rope_scaling.get("beta_fast", 32.0))
+        beta_slow = float(rope_scaling.get("beta_slow", 1.0))
+        attn_factor = float(rope_scaling.get("attention_factor", 1.0))
+        if max_len / orig_max > 1.0:
+            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(base))
+            low = max(math.floor(inv_dim(beta_fast)), 0)
+            high = min(math.ceil(inv_dim(beta_slow)), half - 1)
+            ramp = mx.clip((mx.arange(half, dtype=mx.float32) - low) / max(high - low, 0.001), 0, 1)
+            theta = theta * (1 - ramp + ramp / factor)
     pos = mx.arange(max_len, dtype=mx.float32)
     freqs = mx.outer(pos, theta)               # [T, half]
-    return mx.cos(freqs), mx.sin(freqs)        # each [T, half]
+    cos = mx.concatenate([mx.cos(freqs), mx.cos(freqs)], axis=-1) * attn_factor
+    sin = mx.concatenate([mx.sin(freqs), mx.sin(freqs)], axis=-1) * attn_factor
+    return cos, sin
 
 
 def _apply_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     """
     Apply RoPE to x [B, T, nH, d].
-    cos/sin: [T, d_eff/2] where d_eff = d rounded down to even.
-
-    When d is odd, the trailing element is passed through unchanged so the
-    output shape matches the input. (Some Chronos checkpoints were saved
-    with rope_dim = head_dim - 1, which is odd whenever head_dim is even
-    — head_dim = hidden_size / num_heads = 256/8 = 32 → rope_dim = 31.)
+    cos/sin: full duplicated MiniMind tables, sliced to x.shape[-1].
     """
-    B, T, nH, d = x.shape
-    d_eff = d - (d % 2)
-    half = d_eff // 2
-    x1 = x[..., :half]                          # [B, T, nH, half]
-    x2 = x[..., half:d_eff]                     # [B, T, nH, half]
-    c = cos[:T, :half][:, None, :]              # [T, 1, half]
-    s = sin[:T, :half][:, None, :]
-    rotated = mx.concatenate([x1 * c - x2 * s,
-                              x1 * s + x2 * c], axis=-1)  # [B, T, nH, d_eff]
-    if d_eff < d:
-        # Append the unrotated tail so the output keeps the original last dim.
-        tail = x[..., d_eff:]
-        rotated = mx.concatenate([rotated, tail], axis=-1)
-    return rotated
+    _B, T, _nH, d = x.shape
+    c = cos[:T, :d][:, None, :]
+    s = sin[:T, :d][:, None, :]
+    half = d // 2
+    rotated_half = mx.concatenate([-x[..., half:], x[..., :half]], axis=-1)
+    return (x * c + rotated_half * s).astype(x.dtype)
 
 
 class MLAAttentionMLX(nn.Module):
@@ -80,15 +85,26 @@ class MLAAttentionMLX(nn.Module):
 
         self.q_nope_proj = nn.Linear(H, self.n_heads * self.nope_dim, bias=False)
         self.q_rope_proj = nn.Linear(H, self.n_heads * self.rope_dim, bias=False)
+        self.q_nope_norm = nn.RMSNorm(self.nope_dim, eps=config.rms_norm_eps)
+        self.q_rope_norm = nn.RMSNorm(self.rope_dim, eps=config.rms_norm_eps)
         self.kv_down_proj = nn.Linear(H, self.kv_latent_dim, bias=False)
+        self.kv_down_norm = nn.RMSNorm(self.kv_latent_dim, eps=config.rms_norm_eps)
         self.k_nope_proj  = nn.Linear(self.kv_latent_dim, self.n_kv_heads * self.nope_dim, bias=False)
         self.k_rope_proj  = nn.Linear(self.kv_latent_dim, self.n_kv_heads * self.rope_dim, bias=False)
         self.v_proj       = nn.Linear(self.kv_latent_dim, self.n_kv_heads * self.head_dim, bias=False)
         self.o_proj       = nn.Linear(self.n_heads * self.head_dim, H, bias=False)
 
-        cos, sin = _rope_freqs(self.rope_dim)
-        self.cos = cos   # [max_len, rope_dim/2]  — not a parameter
-        self.sin = sin
+        rope_len = int(getattr(config, "max_position_embeddings", 4096))
+        cos, sin = _rope_freqs(
+            self.head_dim,
+            max_len=rope_len,
+            base=float(getattr(config, "rope_theta", 1_000_000.0)),
+            rope_scaling=getattr(config, "rope_scaling", None),
+        )
+        # Bypass mlx.nn.Module.__setattr__; these are runtime lookup tables,
+        # not trainable checkpoint parameters.
+        object.__setattr__(self, "_cos", cos)
+        object.__setattr__(self, "_sin", sin)
 
     def __call__(
         self,
@@ -99,11 +115,15 @@ class MLAAttentionMLX(nn.Module):
         B, S, H = x.shape
 
         # ── Queries ───────────────────────────────────────────────
-        q_nope = self.q_nope_proj(x).reshape(B, S, self.n_heads, self.nope_dim)
-        q_rope = self.q_rope_proj(x).reshape(B, S, self.n_heads, self.rope_dim)
+        q_nope = self.q_nope_norm(
+            self.q_nope_proj(x).reshape(B, S, self.n_heads, self.nope_dim)
+        )
+        q_rope = self.q_rope_norm(
+            self.q_rope_proj(x).reshape(B, S, self.n_heads, self.rope_dim)
+        )
 
         # ── KV latent (what gets cached) ──────────────────────────
-        c_kv = self.kv_down_proj(x)             # [B, S, kv_latent_dim]
+        c_kv = self.kv_down_norm(self.kv_down_proj(x))             # [B, S, kv_latent_dim]
 
         # Append to cache
         if cache is not None:
@@ -123,9 +143,9 @@ class MLAAttentionMLX(nn.Module):
         # ── RoPE ──────────────────────────────────────────────────
         past_len = T_full - S
         q_rope = _apply_rope(q_rope,
-                              self.cos[past_len:past_len + S],
-                              self.sin[past_len:past_len + S])
-        k_rope = _apply_rope(k_rope, self.cos[:T_full], self.sin[:T_full])
+                              self._cos[past_len:past_len + S],
+                              self._sin[past_len:past_len + S])
+        k_rope = _apply_rope(k_rope, self._cos[:T_full], self._sin[:T_full])
 
         # Concat nope + rope
         q = mx.concatenate([q_nope, q_rope], axis=-1)  # [B, S, nH, head_dim]
@@ -170,11 +190,18 @@ class SlidingWindowAttentionMLX(nn.Module):
         self.k_proj = nn.Linear(H, self.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(H, self.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, H, bias=False)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        rope_dim = self.head_dim
-        cos, sin = _rope_freqs(rope_dim)
-        self.cos = cos
-        self.sin = sin
+        rope_len = int(getattr(config, "max_position_embeddings", 4096))
+        cos, sin = _rope_freqs(
+            self.head_dim,
+            max_len=rope_len,
+            base=float(getattr(config, "rope_theta", 1_000_000.0)),
+            rope_scaling=getattr(config, "rope_scaling", None),
+        )
+        object.__setattr__(self, "_cos", cos)
+        object.__setattr__(self, "_sin", sin)
 
     def __call__(
         self,
@@ -184,21 +211,23 @@ class SlidingWindowAttentionMLX(nn.Module):
     ):
         B, S, H = x.shape
 
-        q = self.q_proj(x).reshape(B, S, self.n_heads,    self.head_dim)
-        k = self.k_proj(x).reshape(B, S, self.n_kv_heads, self.head_dim)
-        v = self.v_proj(x).reshape(B, S, self.n_kv_heads, self.head_dim)
+        q = self.q_norm(self.q_proj(x).reshape(B, S, self.n_heads, self.head_dim))
+        k_new = self.k_norm(self.k_proj(x).reshape(B, S, self.n_kv_heads, self.head_dim))
+        v_new = self.v_proj(x).reshape(B, S, self.n_kv_heads, self.head_dim)
+
+        past_len = cache[0].shape[1] if cache is not None else 0
+        q = _apply_rope(q, self._cos[past_len:past_len + S], self._sin[past_len:past_len + S])
+        k_new = _apply_rope(k_new, self._cos[past_len:past_len + S], self._sin[past_len:past_len + S])
 
         if cache is not None:
             k_past, v_past = cache
-            k = mx.concatenate([k_past, k], axis=1)
-            v = mx.concatenate([v_past, v], axis=1)
+            k = mx.concatenate([k_past, k_new], axis=1)
+            v = mx.concatenate([v_past, v_new], axis=1)
+        else:
+            k = k_new
+            v = v_new
 
         T_full = k.shape[1]
-        past_len = T_full - S
-
-        # Apply RoPE to new queries and all keys (before GQA repeat)
-        q = _apply_rope(q, self.cos[past_len:past_len + S], self.sin[past_len:past_len + S])
-        k = _apply_rope(k, self.cos[:T_full], self.sin[:T_full])
 
         # Slide window — keep only last window_size tokens
         if T_full > self.window_size:

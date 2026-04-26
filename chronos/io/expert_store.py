@@ -68,6 +68,15 @@ class LRUCache:
         with self._lock:
             return list(self._cache.keys())
 
+    def reorder_by_score(self, scores: Dict[int, float]):
+        """Order entries from coldest to hottest so LRU evicts low scores."""
+        with self._lock:
+            ordered = sorted(
+                self._cache.keys(),
+                key=lambda key: (float(scores.get(key, 0.0)), key),
+            )
+            self._cache = collections.OrderedDict((key, True) for key in ordered)
+
     def __len__(self):
         with self._lock:
             return len(self._cache)
@@ -172,7 +181,11 @@ class ExpertStore:
         available_bytes = self._physical_ram_bytes()
         safe_bytes = available_bytes * max_fraction
         per_expert_ram = max(self._expert_size_bytes() * self.num_layers, 1)
-        return max(1, min(self.vram_capacity * 4, int(safe_bytes / per_expert_ram)))
+        return max(1, min(
+            self.ram_capacity,
+            self.vram_capacity * 4,
+            int(safe_bytes / per_expert_ram),
+        ))
 
     def _expert_size_bytes(self) -> int:
         if not self.moe_layers:
@@ -254,6 +267,44 @@ class ExpertStore:
                 if os.path.exists(path):
                     continue
                 state = self._expert_state_from_checkpoint(state_dict, li, ei)
+                if state:
+                    torch.save(state, path)
+
+        if replace_live:
+            self.replace_live_experts_with_placeholders()
+
+    def offload_from_state_reader(
+        self,
+        reader,
+        clusters: Optional[List[List[int]]] = None,
+        replace_live: bool = True,
+    ):
+        """Write expert shards to SSD from a random-access export reader.
+
+        This path is used for Chronos safetensors/GGUF exports. It avoids
+        materializing the full expert state dict in DRAM: each expert tensor is
+        pulled from the export artifact only while that expert shard is written.
+        """
+        if self.storage_format == "safetensors" and clusters is None:
+            self.storage_format = "pt"
+            self._cluster_storage = None
+
+        keys = list(reader.keys())
+        for li in range(self.num_layers):
+            for ei in range(self.num_experts):
+                path = self._ssd_path(ei, li)
+                if os.path.exists(path):
+                    continue
+                prefix = f"model.layers.{li}.mlp.experts.{ei}."
+                state = {}
+                for key in keys:
+                    if key.startswith(prefix):
+                        state[key[len(prefix):]] = (
+                            reader.get_tensor(key)
+                            .detach()
+                            .to(dtype=torch.float16, device="cpu")
+                            .contiguous()
+                        )
                 if state:
                     torch.save(state, path)
 
@@ -491,6 +542,16 @@ class ExpertStore:
                 # the CPU too.
                 current.wait_event(evt)
 
+    def touch_expert(self, expert_id: int) -> None:
+        """Mark an expert as recently useful in every resident tier."""
+        self.vram_lru.touch(expert_id)
+        self.ram_lru.touch(expert_id)
+
+    def reprioritize_resident_experts(self, scores: Dict[int, float]) -> None:
+        """Use recent router scores to make low-probability experts evict first."""
+        self.vram_lru.reorder_by_score(scores)
+        self.ram_lru.reorder_by_score(scores)
+
     def sync_h2d(self):
         """Wait for *all* pending H2D weight transfers to complete (legacy)."""
         if self._h2d_stream is not None:
@@ -517,6 +578,10 @@ class ExpertStore:
                         self._ram_buffers[expert_id] = {}
                     self._ram_buffers[expert_id][li] = state
                 self._replace_expert_module(li, expert_id, self._build_placeholder_expert())
+        with self._ram_lock:
+            evicted = self.ram_lru.put(expert_id)
+            if evicted is not None and evicted != expert_id:
+                self._ram_buffers.pop(evicted, None)
         self.vram_lru.remove(expert_id)
 
     # ── Mask generation ───────────────────────────────────────────
